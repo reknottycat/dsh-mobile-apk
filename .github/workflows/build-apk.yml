@@ -38,8 +38,11 @@ jobs:
     if: ${{ !inputs.source_audit }}
     runs-on: ubuntu-latest
     strategy:
+      # 尊重 workflow_dispatch 的 abi 输入：此前 matrix 写死 [arm64, x86_64]，
+      # 导致 abi=arm64 也照跑 x86_64（纯浪费：双倍分钟、x86_64 产物本机用不上）。
+      # both 时才展开成两条；单选时只跑那一条。
       matrix:
-        abi: [arm64, x86_64]
+        abi: ${{ fromJSON(inputs.abi == 'both' && '["arm64","x86_64"]' || format('["{0}"]', inputs.abi)) }}
       fail-fast: false
     env:
       # build-apk.mjs 依赖本仓库顶层 scripts/plugins/vendor/base；apk 仓库 = $GITHUB_WORKSPACE
