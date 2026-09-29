@@ -108,6 +108,18 @@ jobs:
           set -e
           node scripts/build-snapshot-013.mjs "${{ matrix.abi }}"
 
+      # Kotlin 单测（0.14.1 P0）：必须先于 build-apk.mjs 产出 testDebugUnitTest 结果。
+      # build-apk.mjs 无条件调用 check-kotlin-test-count.mjs 且**不传** --allow-missing
+      # （有意为之：结果缺席即判红，防止「类被删/漏编译时 exit 仍 0」的防线删失仍绿），
+      # 而云端链此前不产测试结果 ⇒ 该门禁在 build-apk.yml 上必然判红。
+      # 故本步骤紧接其前、结果目录就位后，才进入打包链。全量取用（同 pr-gate）。
+      - name: Kotlin 单测（:app:testDebugUnitTest 全量，产出结果供数量反回归门禁）
+        shell: bash
+        run: |
+          set -e
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest --no-daemon --console=plain
+
       - name: 构建 APK ${abi}（注入插件 + 门禁 + gradle + 产物）
         shell: bash
         run: |
