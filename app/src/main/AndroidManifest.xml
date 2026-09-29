@@ -22,6 +22,13 @@
   <!-- 0.13.2 W7：悬浮球（系统级悬浮窗，用户经设置页授予；OverlayController 引导）。 -->
   <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
+  <!-- 语音输入插件（@local/dsh-plugin-voice-input 等，Web Speech API）需要麦克风。
+       此前 manifest 未声明 RECORD_AUDIO，导致 appops 为 RECORD_AUDIO: ignore，
+       系统权限页也不出现「麦克风」入口，语音输入恒为「权限被拒绝」。 -->
+  <uses-permission android:name="android.permission.RECORD_AUDIO" />
+  <!-- 设备操控插件（@zseven-w/dsh-android：截图 / Vision OCR / UI 树）需要摄像头。 -->
+  <uses-permission android:name="android.permission.CAMERA" />
+
   <application
     android:label="@string/app_name"
     android:icon="@mipmap/ic_launcher"
