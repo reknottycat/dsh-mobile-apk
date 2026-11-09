@@ -39,7 +39,7 @@ jobs:
     env:
       DSH_APK_DIR: ${{ github.workspace }}
       APK_SUFFIX: ${{ inputs.suffix || '' }}
-      NPM_CONFIG_CACHE: ${{ runner.temp }}/dsh-npm-cache
+      NPM_CONFIG_CACHE: /tmp/dsh-mobile-npm-cache
     steps:
       - uses: actions/checkout@v4
         with:
