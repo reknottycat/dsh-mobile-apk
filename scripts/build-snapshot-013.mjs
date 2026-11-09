@@ -764,21 +764,90 @@ try {
 // 避免被当成通用命令；由 profile 的 nodeExecutable 绝对路径直接引用）。
 // 边界（如实登记）：真机 Enforcing 上的 EACCES 字面**未复现**（本机是 Permissive 模拟器）；
 // 上游 pnpm/git 那条「引号包裹路径」的写法在本文件里保持一致。
+// Shared runtime prefix calculation for the Harness 0.2.2 PTC launcher.
+const SELF_LOCATE_PREAMBLE = (label) => [
+  '#!/system/bin/sh',
+  '# dsh-mobile: ' + label + '（自定位：前缀由 $0 推导，不烧构建期设备路径 —— issue #1234）',
+  'self=$0',
+  'case "$self" in /*) ;; *) self=$(command -v "$self") ;; esac',
+  'if command -v readlink >/dev/null 2>&1; then',
+  '  resolved=$(readlink -f "$self" 2>/dev/null) || resolved=',
+  '  [ -n "$resolved" ] && self=$resolved',
+  'fi',
+  'prefix=$(cd "$(dirname "$self")/.." && pwd)',
+]
+// 自定位要素：门禁与写后自检都按这两条判「真的会自定位」，不是只看「没烧前缀」。
+const SELF_LOCATE_LINE = 'prefix=$(cd "$(dirname "$self")/.." && pwd)'
+// 写后自检判据（7a/7d/7c1/7e 尾部逐条断言）：
+//   ① shim 文本不得含构建期设备前缀字面量（/data/user/<n>/ 或旧 Termux 前缀）——多用户设备上必 127；
+//   ② 自定位行必须在场——只证明「没烧前缀」不够，还要证明「会自定位」。
+const SHIM_BUILTIN_PREFIX_RE = /\/data\/(user\/\d+|data\/com\.termux)\//
+
+/**
+ * 写完一个 shim 后立刻自检；不满足即拒绝出快照（不静默）。
+ *
+ * 为什么把这段抽出来：7e 里原本只对 pnpm/npm 做了这两条断言，tar/git/PTC 三个 shim 一个都没有——
+ * 这正是「同类缺陷只修了报障的那两个」的形态（issue #1234）。判据一份，四个 shim 都过它。
+ *
+ * @param {string} rel usr 树内相对路径（报告用）。
+ * @param {string} text shim 全文。
+ */
+const assertSelfLocatingShim = (rel, text) => {
+  const hit = SHIM_BUILTIN_PREFIX_RE.exec(text)
+  if (hit) {
+    console.error('  [shim 自检失败] usr/' + rel + ' 含构建期设备前缀字面量 ' + hit[0]
+      + '——多用户设备（/data/user/<n>）上 exec 必失败（exit 127）')
+    process.exit(1)
+  }
+  if (!text.includes(SELF_LOCATE_LINE)) {
+    console.error('  [shim 自检失败] usr/' + rel + ' 缺自定位行: ' + SELF_LOCATE_LINE)
+    process.exit(1)
+  }
+  log('  shim 自检通过: usr/' + rel + '（无构建期前缀字面量 + 自定位行在场）')
+}
+
+
 const PTC_NODE_WRAPPER_REL = 'libexec/dsh-node'
 try {
   const wrapperDir = join(U, 'libexec')
   mkdirSync(wrapperDir, { recursive: true })
-  // 设备路径烧写（同 git wrapper / pnpm shim）：执行目标必须是设备端路径，绝不可用本地 stage 路径。
+  // issue #1234：exec 目标与 LD_LIBRARY_PATH 原先烧 NEW_PREFIX（构建期设备路径）——多用户设备上
+  // wrapper 自己就先 127。改为与 pnpm/git 同一套自定位前导：`$prefix` 由 $0 反推，构建期零字面量。
   writeFileSync(
     join(U, PTC_NODE_WRAPPER_REL),
-    '#!/system/bin/sh\n'
-      + '# dsh-mobile: PTC node launcher (C1) - app-data ELF cannot be exec\'d under untrusted_app,\n'
+    SELF_LOCATE_PREAMBLE('PTC node launcher (C1) - app-data ELF cannot be exec\'d under untrusted_app').join('\n')
+      + '\n'
       + '# so hand it to the system linker with the snapshot library path exported here.\n'
-      + 'export LD_LIBRARY_PATH="' + NEW_PREFIX + '/lib"\n'
-      + 'exec /system/bin/linker64 "' + NEW_PREFIX + '/bin/node" "$@"\n',
+      + 'export LD_LIBRARY_PATH="$prefix/lib"\n'
+      // ── 引擎/子进程 V8 堆下限（0.14.8）────────────────────────────────────────
+      // 为什么放在**启动器**而不是只靠壳侧 env：本 wrapper 是快照内 node 的唯一启动器，
+      // 而有些调用方给子进程的是**过滤后的 env**（PTC 只放 6 个名字，见上方真因），
+      // 壳侧 shellEnv() 注入的 NODE_OPTIONS 到不了那种路径。把下限写在启动器里，
+      // 任何「经由 libexec/dsh-node 启动」的路径都拿到同一个底线。
+      // 自适应在**设备上**算而不是构建期写死：MemTotal 只有运行时才准确。
+      // 语义 = clamp(MemTotal/2, 512, 4096)MB，与壳侧 EngineManager.engineHeapMb 同口径
+      // （两处必须同值；任何一方改了，另一方由门禁 check-engine-heap-floor.mjs 判红）。
+      // ⚠️ 上限 1024 会让 /2 分支在**所有真机**上被截断（0.14.8 缺陷：自适应下限形同虚设，
+      // 用户只能自己提上限）。上限必须显著大于 V8 自然导出的 1024 标志档，见 ENGINE_HEAP_CAP_MB。
+      // 仅在 NODE_OPTIONS **未被调用方设置**时才填：调用方显式给的值（例如 PTC 的
+      // maxOldGenerationSizeMb、用户自定义 --max-old-space-size）必须优先，不得被启动器覆盖。
+      // 纯 sh 读 /proc/meminfo，不依赖 sed/awk/busybox 子命令（缺工具也不至于副作用）。
+      + 'if [ -z "$NODE_OPTIONS" ]; then\n'
+      + '  __dsh_mem_kb=0\n'
+      + '  while read -r __dsh_key __dsh_val __dsh_rest; do\n'
+      + '    if [ "$__dsh_key" = "MemTotal:" ]; then __dsh_mem_kb=$__dsh_val; break; fi\n'
+      + '  done < /proc/meminfo\n'
+      + '  __dsh_heap=$(( __dsh_mem_kb / 2048 ))\n'
+      + '  [ "$__dsh_heap" -lt 512 ] && __dsh_heap=512\n'
+      + '  [ "$__dsh_heap" -gt 4096 ] && __dsh_heap=4096\n'
+      + '  export NODE_OPTIONS="--max-old-space-size=$__dsh_heap"\n'
+      + 'fi\n'
+      + 'exec /system/bin/linker64 "$prefix/bin/node" "$@"\n',
     { mode: 0o755 },
   )
-  log('PTC node wrapper 就位: usr/' + PTC_NODE_WRAPPER_REL + ' -> linker64 + bin/node（LD_LIBRARY_PATH 在 wrapper 内 export）')
+  // 写后自检：PTC wrapper 与 tar/git/pnpm/npm 过同一条判据（无构建期前缀 + 自定位行在场）。
+  assertSelfLocatingShim(PTC_NODE_WRAPPER_REL, readFileSync(join(U, PTC_NODE_WRAPPER_REL), 'utf8'))
+  log('PTC node wrapper 就位: usr/' + PTC_NODE_WRAPPER_REL + ' -> linker64 + bin/node（LD_LIBRARY_PATH + 堆下限在 wrapper 内）')
 } catch (e) {
   // 不静默：PTC 是本里程碑验收项（`code run` 是模型的主要执行手段），装配失败必须可见。
   console.error('  [PTC wrapper 装配失败] ' + (e?.stack ?? String(e)))

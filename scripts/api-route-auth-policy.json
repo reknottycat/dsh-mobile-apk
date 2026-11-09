@@ -1,5 +1,5 @@
 {
-  "$comment": "0.14.0 #222 API route inventory. Every exact/prefix registration owned by the mobile product must be listed. protected routes require a local auth marker; public routes require a narrow response marker and explicit rationale. upstreamRoutes（D2）审计上游 packages/**/src/** 的注册面：每条上游 web/upgrade/fetch 注册站点必须有一条显式判定（protected / public / not-mounted），反向断言与 stale 检查见 check-api-route-auth.mjs 的上游段。",
+  "$comment": "0.14.0 #222 API route inventory. Every exact/prefix registration owned by the mobile product must be listed. protected routes require a local auth marker; public routes require a narrow response marker and explicit rationale. upstreamRoutes（D2）审计上游 packages/**/src/** 的注册面：每条上游 web/upgrade/fetch 注册站点必须有一条显式判定（protected / public / not-mounted），反向断言与 stale 检查见 check-api-route-auth.mjs 的上游段。 2026-11-09: re-audited against official Harness dsh-v0.2.2-rc.1 (66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db) and this repository retained Android profile; new inventory rows are based on Android v0.14.11, then checked against the actual source and mount surface.",
   "version": 1,
   "routeRegistrations": [
     {
@@ -36,7 +36,7 @@
     },
     {
       "source": "dsh-host-web-compat/lib/index.js",
-      "expected": 3
+      "expected": 4
     }
   ],
   "dynamicPathExpressions": [
@@ -243,6 +243,18 @@
       "authCallMarker": "if (!authorized(req))"
     },
     {
+      "id": "directory-pick-browse",
+      "path": "/api/android/dir-pick/browse",
+      "kind": "exact",
+      "registrationSource": "dsh-host-web-compat/lib/index.js",
+      "registration": "path: '/api/android/dir-pick/browse'",
+      "endpointSource": "dsh-host-web-compat/lib/index.js",
+      "access": "protected",
+      "authMarker": "if (!authorized(req))",
+      "authCallMarker": "if (!authorized(req))",
+      "rationale": "Host 0.1.16 legacy workspace directory browsing checks the non-empty DSH_PICK_TOKEN via x-dsh-pick-token first, then requires a delivered picker request ID. Missing credentials return 403; missing legacy mode or expired request returns 404 before filesystem access."
+    },
+    {
       "id": "directory-pick-result",
       "path": "/api/android/dir-pick/result",
       "kind": "exact",
@@ -316,14 +328,14 @@
       "expression": "REMOTE_STREAM_MUX_PATH",
       "pathText": "/api/remote.mux",
       "verdict": "protected",
-      "authMarker": "webCtx.connection.admit(req)",
-      "authCallMarker": "webCtx.connection.admit(req)",
+      "authMarker": "webCtx.connection.admitConnection(req)",
+      "authCallMarker": "webCtx.connection.admitConnection(req)",
       "bundleRowId": "typert-gateway",
       "pathEvidence": {
         "file": "packages/api/gateway/src/stream-protocol.ts",
         "marker": "export const REMOTE_STREAM_MUX_PATH = '/api/remote.mux'"
       },
-      "evidence": "升级路由无 kind 字段；注册块内先走 Host/Origin 栅栏 + browserAuth 的 admit()，rejection 即 rejectRemoteStreamUpgrade——与 client-connection 的 /api 前缀同一道门。"
+      "evidence": "0.2.2 的 upgrade 注册块先调用 webCtx.connection.admitConnection(req)，失败即 rejectRemoteStreamUpgrade。rpc-host.ts 的 admitConnection 先走 admit 的 Host/Origin 栅栏和 browserAuth 认证，再独占 API Peer 的 socket（重复归属拒绝 409）；关闭时 release 清理归属。"
     },
     {
       "source": "packages/api/session-controller/src/media-references.ts",
@@ -519,15 +531,214 @@
       "evidence": "会话日志 ZIP 下载走 connection.fetch；/api 前缀 handler 的 admit 栅栏之前不会到达该 Fetch 路由，故不需要自带 guard。"
     },
     {
-      "source": "packages/webhook/webhook-github/src/index.ts",
+      "source": "packages/client/connection/src/index.ts",
+      "form": "web",
+      "expression": "CONNECT_PATH",
+      "kind": "exact",
+      "pathText": "/connect",
+      "verdict": "protected",
+      "authMarker": "connection.authorizeConnect(req, res)",
+      "authCallMarker": "connection.authorizeConnect(req, res)",
+      "bundleRowId": "connection",
+      "pathEvidence": {
+        "file": "packages/client/connection/src/connect-protocol.ts",
+        "marker": "export const CONNECT_PATH = '/connect'"
+      },
+      "evidence": "启动令牌交换路由：注册块内 handler 调 connection.authorizeConnect(req, res)——先 isTrusted 的 Host/Origin 栅栏，再 browserAuth.authorizeConnect 认证并发布凭据；失败 403/401。"
+    },
+    {
+      "source": "packages/experimental/inspector/src/host/plugin.ts",
+      "form": "fetch",
+      "expression": "INSPECTOR_BOOTSTRAP_PATH",
+      "pathText": "/api/experimental-inspector/bootstrap",
+      "verdict": "not-mounted",
+      "packageName": "@deepseek-ai/dsh-experimental-inspector",
+      "pathEvidence": {
+        "file": "packages/experimental/inspector/src/shared/web.ts",
+        "marker": "export const INSPECTOR_BOOTSTRAP_PATH = '/api/experimental-inspector/bootstrap'"
+      },
+      "evidence": "实验性 Inspector 的浏览器 bootstrap Fetch 路由。不挂载依据：上游 packages/bundle/base/cordis.patch.yml 与 packages/bundle/web-app/cordis.patch.yml 均无 inspector 行，本仓 scripts/profile-web.cordis.patch.yml 也无 insert ⇒ 发行 profile 不加载该插件。"
+    },
+    {
+      "source": "packages/experimental/inspector/src/host/plugin.ts",
+      "form": "web",
+      "expression": "DEVTOOLS_PATH",
+      "kind": "prefix",
+      "pathText": "/inspector/devtools",
+      "verdict": "not-mounted",
+      "packageName": "@deepseek-ai/dsh-experimental-inspector",
+      "pathEvidence": {
+        "file": "packages/experimental/inspector/src/host/plugin.ts",
+        "marker": "const DEVTOOLS_PATH = '/inspector/devtools'"
+      },
+      "evidence": "DevTools 静态资源前缀路由，随 experimental-inspector 插件一起注册。该包不在 base/web-app bundle 行（packages/bundle/{base,web-app}/cordis.patch.yml 零命中），本仓 scripts/profile-web.cordis.patch.yml 无 insert ⇒ 发行 profile 不挂载。"
+    },
+    {
+      "source": "packages/experimental/inspector/src/host/plugin.ts",
+      "form": "upgrade",
+      "expression": "`${DEVTOOLS_PATH",
+      "pathText": "/inspector/devtools/cdp",
+      "verdict": "not-mounted",
+      "packageName": "@deepseek-ai/dsh-experimental-inspector",
+      "pathEvidence": {
+        "file": "packages/experimental/inspector/src/host/plugin.ts",
+        "marker": "path: `${DEVTOOLS_PATH}/cdp`"
+      },
+      "evidence": "CDP WebSocket upgrade 路由，与 DevTools 前缀同属 experimental-inspector。该包不在 base/web-app bundle 行、本仓 profile patch 无 insert，发行 profile 不加载，upgrade 监听同理不存在。"
+    },
+    {
+      "source": "packages/experimental/webhook-github/src/index.ts",
       "form": "web",
       "expression": "config.path",
       "kind": "exact",
       "pathText": null,
-      "dynamicPathReason": "配置字段：path 来自部署方 cordis.yml 的 Config.path，不是构建期常量；本平台 bundle（base+web-app）没有 webhook-github 行，装配面不会加载该插件。",
+      "dynamicPathReason": "配置字段 config.path 来自用户提供的插件配置，没有构建期单一路径。0.2.2 源路径已从 packages/webhook 移至 packages/experimental，包名仍为 @deepseek-ai/dsh-webhook-github。",
       "verdict": "not-mounted",
       "packageName": "@deepseek-ai/dsh-webhook-github",
-      "evidence": "webhook-github 只出现在 apps/cli 的示例 cordis.yml，不在 base/web-app bundle 行里；移动 profile 不挂载该插件，故 config.path 无任何实际注册。"
+      "evidence": "已逐份核对官方 base/web-app 主 patch 及 web-app 的 standard/ptc/minimal/cordis 四份 preset，均不挂载 dsh-webhook-github；本仓保留的 Android profile 也无该插件 insert。故本构建的发行 profile 不注册此路由；本判定不覆盖用户随后自行安装并启用的插件。"
+    },
+    {
+      "source": "packages/boot/plugin-manager/src/index.ts",
+      "form": "fetch",
+      "expression": "DETAIL_FILE_PATH",
+      "pathText": "/api/plugin-manager/detail-file",
+      "verdict": "protected",
+      "guardedBy": "packages/client/connection/src/index.ts :: web :: API_PATH",
+      "bundleRowId": "plugin-manager",
+      "evidence": "主入口在 base/cordis.patch.yml 的 plugin-manager 行挂载，条件是 profileContext 存在。该行只把 GET DETAIL_FILE_PATH 注册到 scope.connection.fetch，而不是独立 webServer 路由；HTTP 请求必先通过 client-connection 的 /api 前缀 connection.admit(req)，被拒绝即返回 401/403，通过才 dispatch 到该 Fetch handler。",
+      "pathEvidence": {
+        "file": "packages/boot/plugin-manager/src/index.ts",
+        "marker": "const DETAIL_FILE_PATH = '/api/plugin-manager/detail-file'"
+      }
+    },
+    {
+      "source": "packages/boot/plugin-market/src/index.ts",
+      "form": "fetch",
+      "expression": "DETAIL_FILE_PATH",
+      "pathText": "/api/plugin-market/detail-file",
+      "verdict": "not-mounted",
+      "packageName": "@deepseek-ai/dsh-plugin-market",
+      "evidence": "注册详情文件路由的是包的主入口。官方 base/web-app 主 bundle 和本仓 profile 均无该入口行；web-app 的 standard/ptc/cordis 三份 preset 只有 dsh-plugin-market/tools 子导出且 disabled: true，该子导出不注册本路由。因此本构建的发行 profile 不挂载主入口，不能据包文件存在推断路由存在。",
+      "pathEvidence": {
+        "file": "packages/boot/plugin-market/src/index.ts",
+        "marker": "const DETAIL_FILE_PATH = '/api/plugin-market/detail-file'"
+      }
+    },
+    {
+      "source": "packages/experimental/liveshare/src/host/owner-http-routes.ts",
+      "form": "fetch",
+      "expression": "'/api/liveshare.ownerCredential'",
+      "pathText": "/api/liveshare.ownerCredential",
+      "verdict": "not-mounted",
+      "packageName": "@deepseek-ai/dsh-experimental-liveshare",
+      "evidence": "本注册站点属于 dsh-experimental-liveshare。已核对官方 base/web-app 主 patch、web-app 四份 preset 和本仓 Android profile，均无该包挂载行，因此本构建的发行 profile 不注册此站点；不把未启用功能描述为可用，也不对用户后续自行启用作假定。"
+    },
+    {
+      "source": "packages/experimental/liveshare/src/host/owner-http-routes.ts",
+      "form": "fetch",
+      "expression": "path",
+      "pathText": null,
+      "dynamicPathReason": "registerOwnerJsonRoute 把传入的 path 交给 connection.fetch.register，故此注册站点没有单一常量。实际两处调用为 /api/liveshare.ownerLoginRedeem 与 /api/liveshare.ownerLoginCancel；ownerLoginStart 是另一个独立字面量注册站点。",
+      "verdict": "not-mounted",
+      "packageName": "@deepseek-ai/dsh-experimental-liveshare",
+      "evidence": "本注册站点属于 dsh-experimental-liveshare。已核对官方 base/web-app 主 patch、web-app 四份 preset 和本仓 Android profile，均无该包挂载行，因此本构建的发行 profile 不注册此站点；不把未启用功能描述为可用，也不对用户后续自行启用作假定。"
+    },
+    {
+      "source": "packages/experimental/liveshare/src/host/owner-http-routes.ts",
+      "form": "fetch",
+      "expression": "'/api/liveshare.ownerLoginStart'",
+      "pathText": "/api/liveshare.ownerLoginStart",
+      "verdict": "not-mounted",
+      "packageName": "@deepseek-ai/dsh-experimental-liveshare",
+      "evidence": "本注册站点属于 dsh-experimental-liveshare。已核对官方 base/web-app 主 patch、web-app 四份 preset 和本仓 Android profile，均无该包挂载行，因此本构建的发行 profile 不注册此站点；不把未启用功能描述为可用，也不对用户后续自行启用作假定。"
+    },
+    {
+      "source": "packages/session-query/session-log-export/src/index.ts",
+      "form": "fetch",
+      "expression": "SESSION_MARKDOWN_EXPORT_PATH",
+      "pathText": "/api/session.markdown",
+      "verdict": "protected",
+      "guardedBy": "packages/client/connection/src/index.ts :: web :: API_PATH",
+      "bundleRowId": "session-log-download",
+      "evidence": "session-log-download 行在官方 web-app 主 patch 中挂载，本仓 profile 未禁用。该 Markdown 导出仅经 connectionOf(ctx).fetch.register 注册 GET/HEAD；HTTP 入口是 client-connection 的 /api 前缀，先执行 connection.admit(req)，拒绝时不调用共享 Fetch 分发器。",
+      "pathEvidence": {
+        "file": "packages/session-query/session-log-export/src/routes.ts",
+        "marker": "export const SESSION_MARKDOWN_EXPORT_PATH = '/api/session.markdown'"
+      }
+    }
+  ],
+  "mobileFetchGroups": [
+    {
+      "source": "vendor/dsh-plugin-subscriptions/lib/index.js",
+      "packageName": "dsh-plugin-subscriptions",
+      "entryFile": "lib/index.js",
+      "endpointConstant": "SUBSCRIPTIONS_AUTH_ENDPOINTS",
+      "prefixConstant": "SUBSCRIPTIONS_AUTH_PREFIX",
+      "prefix": "subscriptions-auth.",
+      "factoryFunction": "fetchRouteFor",
+      "registrationFunction": "registerAuthRpc",
+      "guardedBy": "packages/client/connection/src/index.ts :: web :: API_PATH",
+      "endpoints": [
+        "codexCustomGet",
+        "codexCustomSet",
+        "providerSettings",
+        "setProviderSettings",
+        "status",
+        "login",
+        "manual",
+        "cancel",
+        "logout",
+        "setDefault",
+        "usage",
+        "image",
+        "video",
+        "prepareReset",
+        "consumeReset",
+        "speed",
+        "setSpeed",
+        "proxyGet",
+        "proxySet",
+        "proxyTest",
+        "modelDefaults",
+        "setModelDefault"
+      ],
+      "evidence": "订阅插件0.9.12的22条POST RPC只注册到当前Context的connection.fetch，不创建独立WebServer路由。HTTP请求先通过官方client-connection /api前缀的Host/Origin与browserAuth admit，之后才分发；工厂还校验JSON envelope的method等于当前endpoint。codexCustomGet/Set沿用同一载体，Get只返回配置与keyConfigured，Set只写独立codex-custom路由和私有凭据ref。编译入口与lib/auth/rpc.js镜像均核对，注入后的web/headless两个包副本重复验证。"
+    },
+    {
+      "source": "vendor/dsh-plugin-subscriptions/lib/auth/rpc.js",
+      "packageName": "dsh-plugin-subscriptions",
+      "entryFile": "lib/auth/rpc.js",
+      "endpointConstant": "SUBSCRIPTIONS_AUTH_ENDPOINTS",
+      "prefixConstant": "SUBSCRIPTIONS_AUTH_PREFIX",
+      "prefix": "subscriptions-auth.",
+      "factoryFunction": "fetchRouteFor",
+      "registrationFunction": "registerAuthRpc",
+      "guardedBy": "packages/client/connection/src/index.ts :: web :: API_PATH",
+      "endpoints": [
+        "codexCustomGet",
+        "codexCustomSet",
+        "providerSettings",
+        "setProviderSettings",
+        "status",
+        "login",
+        "manual",
+        "cancel",
+        "logout",
+        "setDefault",
+        "usage",
+        "image",
+        "video",
+        "prepareReset",
+        "consumeReset",
+        "speed",
+        "setSpeed",
+        "proxyGet",
+        "proxySet",
+        "proxyTest",
+        "modelDefaults",
+        "setModelDefault"
+      ],
+      "evidence": "订阅插件0.9.12的22条POST RPC只注册到当前Context的connection.fetch，不创建独立WebServer路由。HTTP请求先通过官方client-connection /api前缀的Host/Origin与browserAuth admit，之后才分发；工厂还校验JSON envelope的method等于当前endpoint。codexCustomGet/Set沿用同一载体，Get只返回配置与keyConfigured，Set只写独立codex-custom路由和私有凭据ref。编译入口与lib/auth/rpc.js镜像均核对，注入后的web/headless两个包副本重复验证。"
     }
   ]
 }

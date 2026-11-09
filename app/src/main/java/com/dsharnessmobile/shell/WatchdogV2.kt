@@ -188,8 +188,17 @@ object WatchdogV2 {
   var lastLogTail: String = ""
     private set
 
+  @Volatile
+  internal var lastProbeDetail = ""
+    private set
+
+  internal fun pluginTreeStillFailed(context: Context): Boolean =
+    logSignatureOf(readEngineLogTail(context)) == SIGNATURE_PLUGIN_TREE
+
   fun assessProbe(context: Context): ProbeState {
+    val generation = EngineManager.currentGeneration()
     val probe = EngineProbe.check(2_500)
+    lastProbeDetail = engineProbeDetail(probe, generation)
     // 「超时」与「拒绝」是两种病因：前者是慢，后者是死。记下来供证据面使用。
     lastProbeTimedOut = probe.optString("error", "") == "timeout"
     // 日志尾部**必须在任何早退之前读**：证据门关心的正是 DEGRADED_HTTP 这一支

@@ -254,8 +254,9 @@ export function DevSection({ renderSlot }: DevSectionProps) {
   const exportConfig = useCallback(() => {
     try {
       const raw = window.androidBridge?.exportConfig?.()
-      const j = JSON.parse(raw ?? '{}') as { ok?: boolean; path?: string; error?: string }
-      setConfigMsg(j.ok ? `已导出到 ${j.path ?? 'exports/config/settings.yaml'}` : `导出失败：${j.error ?? '未知错误'}`)
+      const j = JSON.parse(raw ?? '{}') as { ok?: boolean; path?: string; importable?: boolean; hint?: string; error?: string }
+      const hint = j.hint || (j.importable === false ? '这是完整配置备份，不能原样从共享目录导入。' : '')
+      setConfigMsg(j.ok ? `已导出到 ${j.path ?? 'exports/config/'}${hint ? `。${hint}` : ''}` : `导出失败：${j.error ?? '未知错误'}`)
     } catch {
       setConfigMsg('导出失败：应用内连接不可用（仅安卓应用内可用）——请重新打开应用后重试')
     }
@@ -264,8 +265,9 @@ export function DevSection({ renderSlot }: DevSectionProps) {
   const importConfig = useCallback(() => {
     try {
       const raw = window.androidBridge?.importConfig?.()
-      const j = JSON.parse(raw ?? '{}') as { ok?: boolean; hint?: string; error?: string }
-      setConfigMsg(j.ok ? `已导入并生效（原配置备份为 settings.yaml.import-backup）。${j.hint ?? ''}` : `导入失败：${j.error ?? '未知错误'}`)
+      const j = JSON.parse(raw ?? '{}') as { ok?: boolean; backupPath?: string; hint?: string; error?: string }
+      const backup = j.backupPath ? `原配置备份：${j.backupPath}。` : ''
+      setConfigMsg(j.ok ? `已导入配置。${backup}${j.hint ?? ''}` : `导入失败：${j.error ?? '未知错误'}`)
     } catch {
       setConfigMsg('导入失败：应用内连接不可用（仅安卓应用内可用）——请重新打开应用后重试')
     }

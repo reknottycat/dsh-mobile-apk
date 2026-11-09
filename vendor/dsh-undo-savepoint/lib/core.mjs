@@ -20,7 +20,7 @@
  * @module dsh-undo-savepoint/core
  */
 import { createRequire } from 'node:module';
-import { promises as fs, existsSync, readFileSync } from 'node:fs';
+import { promises as fs, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { join, dirname, basename, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -936,8 +936,14 @@ async function homeFingerprint(cfg) {
 }
 function bundleAnchors(cfg, profileDir) {
   const anchors = [];
-  try { anchors.push(createRequire(join(DSH_HOME, 'package.json'))); } catch { /* DSH_HOME 无 package.json 也可 */ }
+  try { anchors.push(createRequire(join(rootDir(cfg, 'home'), 'package.json'))); } catch { /* home 无 package.json 也可 */ }
   try { anchors.push(createRequire(join(profileDir ?? rootDir(cfg, 'profile'), 'package.json'))); } catch { /* profile 无 package.json 也可 */ }
+  // Android 的工厂 bundle 也会安装在引擎产品树里，不在 profile 的 node_modules 中。
+  // 使用真实入口文件做解析锚点，与正在运行的引擎共用搜索树；处理 usr/bin/dsh 软链，
+  // 并保持 home/profile 优先级（损坏的本地覆盖不能被引擎副本掩盖）。
+  if (process.argv[1]) {
+    try { anchors.push(createRequire(realpathSync(resolve(process.argv[1])))); } catch { /* -e / 已删除入口：无引擎锚点 */ }
+  }
   return anchors;
 }
 // profileDir 缺省 = 当前 profile；体检要逐个 profile 判定（v0.4.8）。
@@ -948,11 +954,16 @@ async function bundleCheck(cfg, name, profileDir) {
       let pkg;
       try { pkg = JSON.parse(await fs.readFile(join(cand, 'package.json'), 'utf8')); } catch { continue; }
       const patch = pkg.dsh?.bundle?.patch;
-      if (typeof patch !== 'string' || !patch) {
+      const patches = Array.isArray(patch) ? patch : [patch];
+      if (patches.some((item) => typeof item !== 'string')) {
         return { ok: false, reason: `no dsh.bundle.patch (${name})` };
       }
-      if (!(await pathExists(join(cand, patch)))) {
-        return { ok: false, reason: `dsh.bundle.patch 文件缺失: ${join(cand, patch)}` };
+      // Harness 同时支持单文件与数组（含合法空数组）；逐个校验，不能只检查首项。
+      for (const item of patches) {
+        const target = join(cand, item);
+        let file = false;
+        try { file = (await fs.stat(target)).isFile(); } catch { /* 缺失 / 不可访问 */ }
+        if (!file) return { ok: false, reason: `dsh.bundle.patch 文件缺失: ${target}` };
       }
       return { ok: true, dir: cand };
     }

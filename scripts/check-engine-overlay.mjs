@@ -13,6 +13,10 @@ import { readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execSync } from 'node:child_process'
+import { resolveEnginePatchTarget } from './patches/resolve-engine-patch-target.mjs'
+import { planPiStreaming } from './patches/pi-upstream-streaming-020.mjs'
+import { planPatch as planPtcAndroid } from './patches/ptc-android-native-A1.mjs'
+import { planMimoThinking } from './patches/mimo-thinking-toggle-056.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = dirname(HERE)
@@ -132,14 +136,67 @@ let presetsEntries = 0
 // 内每个 scope=engine 补丁，其 target 文件必须带该补丁的 marker——防「补丁未施加/版本漂移」
 // 的静默半成品（新增补丁自动纳入，无需再手改本文件）。
 for (const patch of PATCH_REGISTRY.patches.filter((p) => p.scope === 'engine' && p.overlayCheck !== false)) {
-  const marker = String(patch.marker ?? '').replace(/（.*$/, '').trim()
-  if (marker.length === 0) continue
-  want.set(patch.target, { kind: 'patch-marker', name: patch.id, version: null, marker })
+  for (const path of [patch.target, ...(patch.additionalTargets ?? [])]) {
+    const marker = String(patch.targetMarkers?.[path] ?? patch.marker ?? '').replace(/（.*$/, '').trim()
+    if (!marker && !patch.verifier) throw new Error('engine patch missing verification: ' + patch.id)
+    const requiredMarkers = [...(want.get(path)?.requiredMarkers ?? []), ...(path === patch.target ? patch.requiredMarkers ?? [] : [])]
+    if (requiredMarkers.some(marker => typeof marker !== 'string' || !marker.trim())) throw new Error('engine patch invalid requiredMarkers: ' + patch.id)
+    want.set(path, { kind: 'patch-marker', name: patch.id, version: null, marker, requiredMarkers: [...new Set(requiredMarkers)],
+      verifier: patch.verifier, discovery: path === patch.target ? patch.targetDiscovery : undefined })
+  }
+  if (patch.verifier) {
+    // 取包根 = 目标路径里**最靠后**的 /lib/ 或 /dist/ 之前那段。不能写成「有 /lib/ 就用 /lib/」：
+// 引擎树里所有路径都以 `usr/lib/node_modules/...` 开头，那个 /lib/ 在索引 3，会让 packageBase 退化成 `usr`
+// （实测：pi-ai 的 dist/api/*.js 被判「usr/package.json 缺失」的假红）。
+const libIdx = patch.target.lastIndexOf('/lib/')
+const distIdx = patch.target.lastIndexOf('/dist/')
+const packageBase = patch.target.slice(0, Math.max(libIdx, distIdx))
+    if (!want.has(packageBase + '/package.json')) want.set(packageBase + '/package.json', { kind: 'verifier-identity', name: patch.id, version: null })
+  }
 }
+
+/** Resolve exact telemetry requirements using the consumer's actual nested lookup order. */
+function exactRuntimeDependencyGaps(present, roots) {
+  const gaps = []
+  const seen = new Set()
+  const queue = [...roots]
+  const resolvePackage = (consumer, dependency) => {
+    let directory = consumer.slice(0, consumer.lastIndexOf('/'))
+    while (directory) {
+      const candidate = directory + '/node_modules/' + dependency + '/package.json'
+      if (!directory.endsWith('/node_modules') && directory !== 'node_modules'
+        && present[candidate]?.name === dependency) return candidate
+      directory = directory.slice(0, Math.max(0, directory.lastIndexOf('/')))
+    }
+    return null
+  }
+  while (queue.length) {
+    const consumer = queue.shift()
+    if (seen.has(consumer)) continue
+    seen.add(consumer)
+    const metadata = present[consumer]
+    if (!metadata) continue
+    for (const [dependency, required] of Object.entries(metadata.runtimeRequirements ?? {})) {
+      const resolved = resolvePackage(consumer, dependency)
+      if (!resolved) {
+        gaps.push({ consumer, dependency, required, actual: null, resolved: null })
+        continue
+      }
+      const actual = present[resolved].version
+      if (/^\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?$/.test(required) && actual !== required) {
+        gaps.push({ consumer, dependency, required, actual, resolved })
+      }
+      queue.push(resolved)
+    }
+  }
+  return gaps
+}
+// Exact dependency resolution ends.
 
 const py = `
 import tarfile, json, sys
-want = json.loads(open(sys.argv[2], 'r', encoding='utf-8').read())
+want = set(json.loads(open(sys.argv[2], 'r', encoding='utf-8').read()))
+discoveries = json.loads(open(sys.argv[6], 'r', encoding='utf-8').read())  # 发现式目标（目录 + 文件名前缀）
 nm = sys.argv[3]
 prefixes = json.loads(open(sys.argv[4], 'r', encoding='utf-8').read())   # 内置预设载体目录，见 CARRIERS
 mounts = set(json.loads(open(sys.argv[5], 'r', encoding='utf-8').read())) # 行面来源文件（bundle/profile patch）
@@ -163,7 +220,13 @@ with tarfile.open(sys.argv[1], 'r|xz') as t:
             continue
         # 关键（0.13.8-b 实锤回归）：want 里既有 package.json，也有 .js/.ts 目标（patch-marker）——
         # 一律要取回内容。曾经这里只放行 package.json，导致 7 个 .js marker 永远「缺失」→ 假红拒打包。
-        need_hit = n in want
+        # want 是「目标路径」的集合；discovery 另用一张表（discovery 是目录+文件名前缀的**发现式**目标，
+        # 精确文件名随上游构建哈希变化，不能钉死 —— 见 resolve-engine-patch-target.mjs）。
+        need_hit = n in want or any(
+            n.startswith(d['directory'] + '/')
+            and '/' not in n[len(d['directory']) + 1:]
+            and n.rsplit('/', 1)[-1].startswith(d['filenamePrefix']) and n.endswith('.js')
+            for d in discoveries)
         need_present = n.endswith('/package.json') and n.startswith(nm)
         if not (need_hit or need_present):
             continue
@@ -182,7 +245,8 @@ with tarfile.open(sys.argv[1], 'r|xz') as t:
                       'deps': list((j.get('dependencies') or {}).keys())
                               + list((j.get('optionalDependencies') or {}).keys())
                               + list((j.get('peerDependencies') or {}).keys()),
-                      'runtimeDeps': list((j.get('dependencies') or {}).keys())}
+                      'runtimeDeps': list((j.get('dependencies') or {}).keys()),
+                      'runtimeRequirements': j.get('dependencies') or {}}
 print(json.dumps({'hits': hits, 'carriers': carriers, 'present': present, 'rowFiles': rowFiles, 'lookedNonPkg': looked_non_pkg}))
 `
 let res
@@ -192,18 +256,23 @@ try {
   const wantFile = join(dirname(snap), `.engine-overlay-want-${process.pid}.json`)
   const carrierFile = join(dirname(snap), `.engine-overlay-carriers-${process.pid}.json`)
   const mountFile = join(dirname(snap), `.engine-overlay-mounts-${process.pid}.json`)
+  const discoveryFile = join(dirname(snap), `.engine-overlay-discovery-${process.pid}.json`)
   writeFileSync(tmpPy, py)
   writeFileSync(wantFile, JSON.stringify([...want.keys(), ...CARRIERS.map(c => c.prefix)]))
+  writeFileSync(discoveryFile, JSON.stringify([...want.values()]
+    .map((m) => m.discovery)
+    .filter((d) => d !== undefined)))
   writeFileSync(carrierFile, JSON.stringify(CARRIERS.map(c => c.prefix)))
   writeFileSync(mountFile, JSON.stringify(ROW_FILES))
   try {
     const snapWin = snap.replace(/\\/g, '/')
-    res = JSON.parse(execSync(`${process.platform === 'win32' ? 'python' : 'python3'} ${JSON.stringify(tmpPy)} ${JSON.stringify(snapWin)} ${JSON.stringify(wantFile)} ${JSON.stringify(NM)} ${JSON.stringify(carrierFile)} ${JSON.stringify(mountFile)}`, { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 }))
+    res = JSON.parse(execSync(`${process.platform === 'win32' ? 'python' : 'python3'} ${JSON.stringify(tmpPy)} ${JSON.stringify(snapWin)} ${JSON.stringify(wantFile)} ${JSON.stringify(NM)} ${JSON.stringify(carrierFile)} ${JSON.stringify(mountFile)} ${JSON.stringify(discoveryFile)}`, { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 }))
   } finally {
     rmSync(tmpPy, { force: true })
     rmSync(wantFile, { force: true })
     rmSync(carrierFile, { force: true })
     rmSync(mountFile, { force: true })
+    rmSync(discoveryFile, { force: true })
   }
 } catch (e) {
   console.error(`ENGINE-OVERLAY CHECK FAILED（扫描执行失败）: ${String(e).slice(0, 400)}`)
@@ -212,6 +281,34 @@ try {
 
 const fails = []
 let checked = 0
+for (const patch of PATCH_REGISTRY.patches.filter(p => p.scope === 'engine' && p.overlayCheck !== false)) {
+  try {
+    if (patch.targetDiscovery) {
+      const target = resolveEnginePatchTarget(patch, Object.entries(res.hits))
+      const meta = want.get(patch.target)
+      want.delete(patch.target)
+      want.set(target, meta)
+    }
+    if (patch.verifier) {
+      const isPi = patch.id === 'pi-upstream-streaming-020' && patch.verifier === patch.id
+      const isPtc = patch.id === 'ptc-android-native-A1' && patch.verifier === patch.id
+      const isMimo = patch.id === 'mimo-thinking-toggle-056' && patch.verifier === patch.id
+      if (!isPi && !isPtc && !isMimo) throw new Error('unknown exact verifier: ' + patch.id)
+      const base = isPi ? NM + 'node_modules/@earendil-works/pi-ai' : NM + 'node_modules/@deepseek-ai/dsh-ptc-runtime-node'
+      const read = file => {
+        const text = res.hits[base + '/' + file]
+        if (typeof text !== 'string') throw new Error('missing exact-verifier target: ' + file)
+        return text
+      }
+      const plan = isPi
+        ? planPiStreaming('', read)
+        : isPtc
+          ? planPtcAndroid('', false, read)
+          : planMimoThinking(file => res.hits[file])
+      if (plan.some(file => file.before !== file.after)) throw new Error('incomplete exact multi-file patch: ' + patch.id)
+    }
+  } catch (error) { fails.push('[exact-patch] ' + patch.id + ': ' + error.message) }
+}
 // 防回归自检（0.13.8-b）：want 含非 package.json 目标（patch-marker 的 .js/.ts）时，扫描器必须真的
 // 取回过这类目标——否则「marker 面」会整体失效而无人知（本轮 7 项假红即此形态）。
 {
@@ -234,7 +331,10 @@ for (const [path, meta] of want) {
     if (ver !== meta.version) fails.push(`[${meta.kind}] 版本不符: ${meta.name} 期望 ${meta.version} 实得 ${ver}`)
     checked++
   } else if (meta.kind === 'patch-marker') {
-    if (!content.includes(meta.marker)) fails.push(`[patch-marker] ${meta.name} 标记「${meta.marker}」缺席（补丁未施加或版本漂移）`)
+    if (!meta.verifier && !content.includes(meta.marker)) fails.push(`[patch-marker] ${meta.name} 标记「${meta.marker}」缺席（快照早于本代码集的补丁集，或补丁未施加；engine 补丁在构建快照时施加，官方 release 快照只含它发布那一刻的补丁集 —— 请用 node scripts/build-snapshot-013.mjs <abi> 按当前代码集重建快照后再打包）`)
+    for (const marker of meta.requiredMarkers ?? []) {
+      if (!content.includes(marker)) fails.push(`[patch-marker] ${meta.name} 必需标记「${marker}」缺席（快照来自旧补丁集）`)
+    }
     checked++
   } else if (meta.kind === 'vendor' || meta.kind === 'nested' || meta.kind === 'pin') {
     // W8：登记清单内的包顺带核验 license 字段（比对 engine-overlay-licenses.json）
@@ -319,27 +419,72 @@ for (const [path, meta] of want) {
   if (mountFilesRead !== ROW_FILES.length) {
     fails.push('行面文件未全部取到（' + mountFilesRead + '/' + ROW_FILES.length + '）——正向闭包判据会空转')
   }
+  /* 行面来源（0.14.6 实测）：mounted 取自 ROW_FILES 三份 cordis.patch.yml（dsh-base / dsh-web-app / profile web）。
+   * 下一个人若要**离线**复算引用链，注意真实链可能与手推不符：实测 regexpp 的真实链是
+   * `@deepseek-ai/dsh-plugin-manager -> @deepseek-ai/dsh-app-boot -> @eslint-community/regexpp`
+   * （引进来的是 dsh-plugin-manager 这条挂载行，不是 dsh-web-app），以本门禁打印的链为准。
+   *
+   * 0.14.6（otel 设备实锤）：本判据原为**一层**——只断言挂载包自己声明的直接运行时依赖在场。
+   * 一层判据挡不住「本体的传递依赖缺席」：got 本体已登记并在场，got 自己的 12 条 dependencies
+   * 全部不在树里 ⇒ 一层判据恒绿。设备后果：dsh-otel 顶部静态 import got 在
+   * got/dist/source/create.js 处 ERR_MODULE_NOT_FOUND ⇒ dsh-otel 整条 failed to import ⇒
+   * session-telemetry-otel pending(waiting for service: otel) ⇒ engine.log "2 entries did not activate"，
+   * 而本地门禁 412 条断言**全绿**（重构前实测：正向闭包缺口 0 但 PASSED）。
+   * 现改为**传递闭包（BFS）**：从行面出发逐层要求在场，缺口逐条列出**完整引用链**
+   * （行面 -> … -> 缺的包），逼一次显式裁决。引用链是本改造的全部价值：它把「谁把这条依赖引进来的」
+   * 直接写在失败输出里，排障者不必再手推闭包。 */
+  // Telemetry uses exact experimental SDK versions; package presence is insufficient.
+  const telemetryRoots = ['@deepseek-ai/dsh-otel', '@deepseek-ai/dsh-session-telemetry-otel']
+    .filter(name => mounted.has(name))
+    .map(name => NM + 'node_modules/' + name + '/package.json')
+  for (const gap of exactRuntimeDependencyGaps(present, telemetryRoots)) {
+    fails.push('[telemetry-runtime] ' + gap.consumer + ' requires ' + gap.dependency + '@' + gap.required
+      + ', resolved ' + (gap.actual ?? 'missing') + ' at ' + (gap.resolved ?? 'no package'))
+  }
   const runtimeGaps = new Map()
-  for (const name of mounted) {
-    const meta = byName.get(name)
-    if (meta === undefined) continue // 行面里但树内没有：反向面/装配链另有判据，这里只管依赖
-    for (const dep of meta.runtimeDeps ?? []) {
-      if (byName.has(dep)) continue
-      if (RUNTIME_MISSING_OK.has(dep)) continue
-      if (!runtimeGaps.has(dep)) runtimeGaps.set(dep, [])
-      runtimeGaps.get(dep).push(name)
+  const closureReached = new Set()
+  {
+    const queue = []
+    for (const name of mounted) {
+      if (closureReached.has(name)) continue
+      closureReached.add(name)
+      if (byName.has(name)) queue.push({ name, chain: [name] })
+    }
+    while (queue.length > 0) {
+      const { name, chain } = queue.shift()
+      for (const dep of byName.get(name)?.runtimeDeps ?? []) {
+        const next = chain.concat(dep)
+        if (byName.has(dep)) {
+          if (closureReached.has(dep)) continue
+          closureReached.add(dep)
+          queue.push({ name: dep, chain: next })
+          continue
+        }
+        if (RUNTIME_MISSING_OK.has(dep)) continue
+        if (!runtimeGaps.has(dep)) runtimeGaps.set(dep, [])
+        // 每条链都记下来（同一条缺席依赖可能由多条行面路径引入）；显示面有界，故封顶 4 条。
+        const chains = runtimeGaps.get(dep)
+        if (chains.length < 4) chains.push(next.join(' -> '))
+      }
     }
   }
-  console.log('  正向闭包：行面 ' + mountFilesRead + ' 文件 / 挂载点 ' + mounted.size + ' 个 / 运行时依赖缺口 ' + runtimeGaps.size)
+  console.log('  正向闭包：行面 ' + mountFilesRead + ' 文件 / 挂载点 ' + mounted.size + ' 个'
+    + ' / 传递可达 ' + closureReached.size + ' / 运行时依赖缺口 ' + runtimeGaps.size)
+  // 自证（0.14.6 防判据空转）：传递闭包必须真的**往下走过层**——可达集不大于挂载点就说明
+  // 快照包元数据或行面解析退化了，本判据在空转。空转比判红更危险：它会安静地放过同一形态的下一次。
+  if (closureReached.size <= mounted.size) {
+    fails.push('正向闭包判据疑似空转：传递可达 ' + closureReached.size + ' 不大于挂载点 ' + mounted.size
+      + '——快照包元数据（runtimeDeps）或行面解析已退化，本判据没有真正走传递层')
+  }
   if (runtimeGaps.size > 0) {
-    for (const [dep, who] of [...runtimeGaps.entries()].sort()) {
-      console.log('    ' + dep + '  <- ' + who.slice(0, 4).join(', ') + (who.length > 4 ? ' 等 ' + who.length + ' 个' : ''))
+    for (const [dep, chains] of [...runtimeGaps.entries()].sort()) {
+      console.log('    ' + dep + '  <- ' + chains.slice(0, 3).join('  |  ') + (chains.length > 3 ? ' 等 ' + chains.length + ' 条链' : ''))
     }
-    fails.push('行面（会被挂载的包）的运行时依赖在快照内不可解析 ' + runtimeGaps.size + ' 条（见上方清单）'
-      + '——登记进 engine-overlay.json 的 packages/vendorTop（含传递依赖），'
+    fails.push('行面（会被挂载的包）的**传递**运行时依赖在快照内不可解析 ' + runtimeGaps.size + ' 条（见上方引用链）'
+      + '——登记进 engine-overlay.json 的 packages/vendorTop（含全部传递依赖），'
       + '或在 check-engine-overlay.mjs 的 RUNTIME_MISSING_OK 里显式豁免并给理由。'
       + '历史教训：execa / @deepseek-ai/libreoffice-kit / cosmokit@1.8.3 都是这么漏的，'
-      + '漏掉的后果是设备 boot 阶段硬崩而本地门禁全绿。'
+      + '0.14.6 又添一例（got 本体在场、12 条传递依赖全缺 ⇒ 设备 dsh-otel failed to import 而门禁全绿）。'
       + '（未挂载的实验性 provider 不在本判据内——它们缺依赖不影响 boot，对它们判红是假红。）')
   }
   checked += 0
@@ -349,10 +494,27 @@ for (const [path, meta] of want) {
   // （版本钉面）或在 extraPresent 里显式声明——从 overlay 表删一个根依赖即红。
   const rootMeta = present[NM + 'package.json']
   const rootDeps = rootMeta?.deps ?? []
-  const rootUnpinned = rootDeps.filter((n) => !declared.has(n)).sort()
-  console.log('  根安装集：直接依赖 ' + rootDeps.length + ' 条 / 未登记 ' + rootUnpinned.length)
+  // 声明但不安装的直接依赖（每条都带上游依据）。**两向判定**：
+  //   ① 未登记且不在此表 ⇒ 判红（版本钉缺失，本条原有语义不变）；
+  //   ② 在此表但快照里**真的存在** ⇒ 也判红（install 面已变，豁免过期，必须删条目而不是留着洗绿）。
+  const uninstalled = new Map((M.uninstalledRootDeps ?? []).map((e) => [e.name, e]))
+  const rootUnpinned = rootDeps.filter((n) => !declared.has(n) && !uninstalled.has(n)).sort()
+  console.log('  根安装集：直接依赖 ' + rootDeps.length + ' 条 / 未登记 ' + rootUnpinned.length
+    + ' / 声明但不安装 ' + uninstalled.size)
   if (rootUnpinned.length > 0) {
     fails.push('dsh 根直接依赖未登记（版本钉缺失）' + rootUnpinned.length + ' 个: [' + rootUnpinned.slice(0, 8).join(', ') + ']')
+  }
+  for (const [name, entry] of uninstalled) {
+    if (rootDeps.includes(name) === false) {
+      fails.push('uninstalledRootDeps 条目 "' + name + '" 已不是 dsh 根直接依赖——上游已改，请删掉该条目')
+      continue
+    }
+    if (byName.has(name)) {
+      fails.push('uninstalledRootDeps 条目 "' + name + '" 在快照里**确实存在**——声明与实况矛盾，'
+        + '该包已进安装面：请改为登记进 packages 并删除本条豁免')
+      continue
+    }
+    console.log('    [未安装] ' + name + '（上游依据：' + String(entry.reason).slice(0, 40) + '…）')
   }
   if (unaccounted.length > 0) {
     fails.push('未登记且依赖闭包不可达的包 ' + unaccounted.length + ' 个: [' + unaccounted.slice(0, 5).join(', ') + ']'

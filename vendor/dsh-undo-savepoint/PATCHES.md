@@ -84,3 +84,7 @@ node scripts/patches/apply-patches.mjs vendor --check   # 退出 0
 三处实现（vendor `core.mjs` S1 / 离线 CLI `dsh-undo-emergency.mjs` / 壳侧 `SafeMode.kt`）
 **同语义**：只摘第三方 insert 子条目，保留 `@deepseek-ai/*`、`@dsh-android/*` 与两个具名插件，
 并保留全部顶层 `disabled: true`。
+
+## 2026-11-09：bundle 预检兼容修复
+
+`lib/core.mjs` 的 bundle 预检接受字符串或字符串数组（包括合法空数组），逐条校验声明的 patch 文件；非法类型与缺失文件仍失败。解析锚点增加实际引擎入口 `process.argv[1]`，让只安装于引擎 node_modules 的 bundle 可被找到。`test/bundle-preflight.test.mjs` 用临时目录与独立子进程复现两条误报，并覆盖非法声明、缺失文件与无效入口。此项是本仓源码分叉，重新 vendor 时必须保留并复跑测试。

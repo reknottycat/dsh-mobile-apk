@@ -103,3 +103,4 @@
 |---|---|---|---|
 | @napi-rs/canvas | 1.0.8 | MIT | [Brooooooklyn/canvas](https://github.com/Brooooooklyn/canvas) |
 | @napi-rs/canvas-android-arm64 | 1.0.8 | MIT | [Brooooooklyn/canvas](https://github.com/Brooooooklyn/canvas)（napi android-arm64 预编译 binding） |
+| dsh-plugin-subscriptions | 0.9.12（Android 适配与自定义 Responses 配置补丁） | MIT, Copyright (c) 2026 V1ki | [V1ki/dsh-plugin-subscriptions](https://github.com/V1ki/dsh-plugin-subscriptions)；完整许可随 `profiles/{web,headless}/node_modules/dsh-plugin-subscriptions/LICENSE` 分发，补丁来源见仓库 `vendor/dsh-plugin-subscriptions/PROVENANCE.md` |

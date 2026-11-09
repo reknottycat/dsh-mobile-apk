@@ -36,7 +36,9 @@ android {
     //    临时工作区 R1-R3；
     // ③ B2 门禁与发布链：新增门禁接进唯一接线面（本地构建链 / 两仓 CI / 发布组装链三处），
     //    快照指纹对账、工具返回值 schema 自检、控制 op 六处登记链、SKIP 计数。
-    versionCode = 43
+    // Fork repair: generation-scoped recovery + Harness 0.2.2-rc.1.
+    // Official v0.14.11 uses code 70; 71 permits an in-place update from either lineage.
+    versionCode = 71
     // Snapshot builds append a suffix (e.g. -SN-1-RC13) via -PversionNameSuffix; release builds pass none.
     val snapshotSuffix = providers.gradleProperty("versionNameSuffix").getOrElse("")
     // 版本号单一来源：UI（GuidePageRenderer）、桥（androidBridge.version）、诊断日志、引擎环境变量
@@ -50,7 +52,7 @@ android {
     //  ⑥ 真机启动链路：完整性判据补齐运行时动态库面 + 链接失败触发重抽取自愈（task-79）；
     //  ⑦ #270 家族：sessionController 激活失败（task-80）。
     // 演进：… → 0.14.2(41) → 0.14.2-fx-1(42) → 0.14.2-fx-2(43)。
-    versionName = "0.14.2-fx-2" + snapshotSuffix
+    versionName = "0.14.12-bootfix.1" + snapshotSuffix
     buildConfigField("String", "TERMUX_VERSION", "\"0.118.3\"")
     // 0.14.0-preview：虚拟屏 P0 建屏矩阵走仪器测试入口（app UID 下运行 = P0-6 要测的调用者身份），
     // 不新增任何产品面（Activity/Bridge/Manifest 均不动）。见 .deploy-tmp/iter-0140/vdisplay-p0.md §8.8。

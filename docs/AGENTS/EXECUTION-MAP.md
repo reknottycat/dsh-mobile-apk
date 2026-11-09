@@ -2461,6 +2461,28 @@ flowchart TD
   L --> P
 ```
 
+## 6.1 启动恢复与退出证据（2026-11-09）
+
+启动和恢复由 `EngineManager.currentGeneration()` 关联同一次引擎进程；Activity、Service、监听观察线程与日志 tail 必须丢弃旧代结果。`EngineRecoveryGuard.kt` 的 `confirmEngineRecovery` 在两次间隔 5 秒的复探后才允许破坏性恢复，`EngineManager` 在实际动作前再次核对代次与 HTTP。401/403 表示已经获得 HTTP 响应，鉴权状态仍单独报告，不作为已认证。`EngineProbeHttpTest.kt` 使用真实本地 HTTP 服务验证错误码与不跟随重定向；`EngineRecoveryGuardTest.kt` 覆盖晚到响应、旧代与取消。
+
+`dsh-host-web-compat/lib/index.js` 的 apply 安装 `lib/engine-exit-probe.mjs`，只观察 boot、正常 exit 与 uncaughtExceptionMonitor，不接管信号。只有 boot 而无退出行不能区分 SIGTERM、SIGKILL、native 崩溃或插件加载前失败；结合壳侧的 action/reason/generation 日志判断。日志不记录 token、argv 或异常正文。
+
+### 固定运行时与兼容升级
+
+`verified-runtime.json` 固定官方安卓 v0.14.11 的提交、双 ABI URL/大小/SHA-256 和 Harness 0.2.2-rc.1 提交。`fetch-verified-runtime.mjs` 先核对其与 contract 的身份，再拒绝截断或哈希不一致的归档；下载后仍走既有注入、ELF、权限/鉴权和 APK 门禁。引擎补丁及夹具按 0.2.2 同代更新，vendor 行保留原安全策略。模型目录从实际输入归档的 pi-ai JSON 生成，不能把新版带 `chat:` 前缀的目录键当作真实模型 ID。三份整文件运行时资产必须与归档对应版本一致。
+
+`SnapshotUserData.prepareStagedSnapshot` 在交换前防止给已迁移用户重播旧 settings；活动配置选择与 PTC launch 迁移由对应 Kotlin 回归保护。只读用户配置时优先保留尚未完成迁移的 legacy settings；不要因为 factory profile 存在就覆盖用户旧配置。
+
+固定运行时的浏览器资源仍必须满足本 fork 的语法下限。`check-browser-syntax-floor.mjs --degrade --archive ... --overlay ...` 与扫描共享文件分类，借 `browser-syntax-archive.py` 只暂存浏览器普通文件，复用既有 esbuild 转换并保留补丁 marker。`inject-all.py --browser-overlay ...` 校验来源与输出哈希，在本地新版插件优先的前提下应用覆盖；符号链接、硬链接保持原语义。两条 builder 同步接线，最终 tar 仍执行原来的全量 AST 与双目标差分扫描。`browser-overlay.test.mjs` 从实际判红的 tiny tar 开始，覆盖转换后的原门禁通过、ESM/CJS 行为、插件优先级与非法目标拒绝。
+
+### Codex 自定义服务
+
+`vendor/dsh-plugin-subscriptions/lib/client/SubscriptionsSection.js` 与实际发货的 `lib/client.js` 在 Codex 订阅卡中提供三字段表单。`codexCustomGet` / `codexCustomSet` 经现有受保护的 Fetch RPC carrier，交给 `lib/codex-custom.js`；服务只操作 `llm-pi-ai.providers.codex-custom` 和自己生成的私有凭据引用，不访问 OAuth 存储。新地址必须配新密钥，配置保存按 revision 比较并处理通知在提交后报错的情形。
+
+该路线选用通用 `openai-responses` 协议。官方 `openai-codex-responses` 需要 JWT 内的 account ID，不能只换 baseURL 就使用普通中转站密钥。`scripts/tests/codex-custom-protocol.test.mjs` 将生产 helper 的原始配置交给锁定的 Harness 适配器，以真实本地 HTTP/SSE 验证请求路径、两次密钥、流式组装、缺失凭据时零请求和 OAuth 零读写。测试依赖单独锁定在 `scripts/tests/codex-protocol-runtime/`，准备脚本只施加已有官方 pi-ai 补丁。
+
+装配清单 `plugin-dirs.json` 与 profile 同时登记订阅插件；`check-contract.mjs` 核对第三方 client 槽位、注入接口和 peer，API 门禁核对两份 RPC 副本及注入后实际字节。`inject-all.py` 保留完整 MIT 许可证。MainActivity 的 manifest 另登记现有回调页使用的 `com.dsharnessmobile.shell://oauth-return` 返回链接；壳只接收回到应用的动作，不处理 OAuth code 或 state，兑换仍留在引擎。
+
 ## 7. 覆盖账本与校验
 
 ```bash
@@ -2491,6 +2513,7 @@ app/src/main/java/com/dsharnessmobile/shell/ApkArtifactCheck.kt
 app/src/main/java/com/dsharnessmobile/shell/EngineManager.kt
 app/src/main/java/com/dsharnessmobile/shell/EngineService.kt
 app/src/main/java/com/dsharnessmobile/shell/EngineProbe.kt
+app/src/main/java/com/dsharnessmobile/shell/EngineRecoveryGuard.kt
 app/src/main/java/com/dsharnessmobile/shell/LiveProbe.kt
 app/src/main/java/com/dsharnessmobile/shell/WatchdogV2.kt
 app/src/main/java/com/dsharnessmobile/shell/LogCollector.kt
@@ -2606,7 +2629,6 @@ glob:plugins/dsh-android-linux-env/test/*.mjs
 glob:plugins/dsh-android-model-capability/test/*.mjs
 glob:plugins/dsh-model-capability/test/*.mjs
 dsh-client-ui-responsive/src/index.ts
-dsh-client-ui-responsive/src/invariant.ts
 dsh-client-ui-responsive/src/css-modules.d.ts
 glob:dsh-client-ui-responsive/src/client/*.ts
 glob:dsh-client-ui-responsive/src/client/*.tsx
@@ -2615,12 +2637,20 @@ glob:dsh-client-ui-responsive/src/client/mobile/*
 glob:dsh-client-ui-responsive/src/client/dev-section/*
 dsh-client-ui-responsive/src/client/general-settings/GeneralSettings.tsx
 dsh-host-web-compat/lib/index.js
+dsh-host-web-compat/lib/legacy-workspace.js
+dsh-host-web-compat/lib/legacy-workspace-page.js
 glob:dsh-host-web-compat/scripts/*
 dsh-shell-termux/src/index.ts
 scripts/build-apk-013.ps1
 scripts/build-snapshot-013.mjs
 scripts/make-snapshot.sh
 scripts/inject-all.py
+scripts/inject-all.test.py
+scripts/browser-overlay.test.mjs
+scripts/browser-syntax-archive.py
+scripts/tests/codex-custom-protocol.test.mjs
+scripts/tests/codex-protocol-runtime/prepare.mjs
+vendor/dsh-plugin-subscriptions/lib/codex-custom.js
 scripts/inject-snapshot.py
 scripts/inject-external-plugins.py
 scripts/relocate-snapshot.py
@@ -2630,6 +2660,27 @@ scripts/patches/registry.json
 scripts/patches/README.md
 scripts/patches/data/compat-map.json
 scripts/patches/data/undo-safe-align-snippet.mjs
+scripts/patches/data/client-index-loader-barrier.mjs
+scripts/patches/data/custom-endpoint-discovery-960.mjs
+scripts/patches/data/custom-first-model-row-960.mjs
+scripts/patches/data/inspector-worker-expose-internals-472.mjs
+scripts/patches/data/managed-port-bind-EP1.mjs
+scripts/patches/data/model-catalog-section-labels-960.mjs
+scripts/patches/data/profile-link-skip-PL1.mjs
+scripts/patches/data/reasoning-envelope-1304.mjs
+scripts/patches/data/registry-scan-c4.mjs
+scripts/patches/data/sidebar-bubble-reorder.mjs
+scripts/patches/data/subprocess-zsh-fpath-A1.mjs
+scripts/patches/data/terminal-shell-candidates-T1.mjs
+scripts/patches/engine-versions.mjs
+scripts/patches/image-expiry-E1.mjs
+scripts/patches/image-history-batch-offload-I1.mjs
+scripts/patches/image-request-preview-P1.mjs
+scripts/patches/lib/replace-once.mjs
+scripts/patches/mimo-thinking-toggle-056.mjs
+scripts/patches/pi-upstream-streaming-020.mjs
+scripts/patches/ptc-android-native-A1.mjs
+scripts/patches/resolve-engine-patch-target.mjs
 glob:scripts/patches/tests/*.test.mjs
 glob:scripts/patches/tests/fixtures/**
 glob:scripts/snapshot-config/*

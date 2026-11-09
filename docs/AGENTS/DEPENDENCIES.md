@@ -10,7 +10,7 @@
 | Kotlin Android 插件 | 2.0.21 | 根 build.gradle.kts（jvmTarget 17） |
 | Gradle | 8.11.1 | gradle-wrapper.properties distributionUrl（发布链必须用本仓 wrapper，勿用系统 gradle） |
 | compileSdk / targetSdk / minSdk | 36 / 34 / 26 | 理由见 docs/AGENTS/ANDROID-API-USAGE.md §5 |
-| versionCode / versionName | 38 / 0.14.0-preview | app/build.gradle.kts:25-30（快照构建可加 -PversionNameSuffix） |
+| versionCode / versionName | 71 / 0.14.12-bootfix.1 | app/build.gradle.kts:25-30（快照构建可加 -PversionNameSuffix） |
 | 签名 | repoDebug（keystore/debug.keystore，CI 与本地字节兼容）；来源审计链同样走这一把并在产出侧断言指纹 | build.gradle.kts 签名块注释：跨机同签名是覆盖安装前提；坑 202 |
 | lint | checkReleaseBuilds=false / abortOnError=false | 离线环境无 lint 缓存，不在发布关键路径 |
 
@@ -58,8 +58,8 @@
 
 ## 5. 内嵌引擎与快照依赖（不进 gradle 的第二依赖面）
 
-- 引擎：`@deepseek-ai/dsh` 0.1.5-rc.1，快照内 `usr/lib/node_modules/@deepseek-ai/dsh`（EngineManager dshBin），web 模式监听 127.0.0.1:3080（--no-open）；APK 版本与引擎版本解耦，桥协议版本化（androidBridge.version）。
-- 快照内 npm 依赖树（@deepseek-ai/* 包、react/shiki 等 cordis 装配）与 Termux 包（node/git/android-tools 等）由协调仓 `scripts/build-snapshot-013.mjs` 构建注入，**不在本仓库管理**。
+- 引擎：`@deepseek-ai/dsh` 0.2.2-rc.1，快照内 `usr/lib/node_modules/@deepseek-ai/dsh`（EngineManager dshBin），web 模式监听 127.0.0.1:3080（--no-open）；APK 版本与引擎版本解耦，桥协议版本化（androidBridge.version）。
+- 快照内 npm 依赖树与 Termux 包的本轮基座来自固定的 Android v0.14.11 发布归档，身份与摘要登记在 `scripts/snapshot-config/verified-runtime.json`；本仓构建并注入兼容插件。历史全源码构建链仍保留自己的版本限制。
 - 许可合规边界：全部第三方清单与许可证全文随包分发在 `assets/licenses/`（THIRD_PARTY_NOTICES.md + GPL-2.0/GPL-3.0/LGPL-2.1/LGPL-3.0 四全文）；清单由协调仓 `scripts/check-third-party.mjs` 从快照 dpkg 清单生成（GPL 义务硬门禁）。本文件只登记构建期依赖；快照内依赖以该文件为权威。
 
 ## 6. 升级策略建议

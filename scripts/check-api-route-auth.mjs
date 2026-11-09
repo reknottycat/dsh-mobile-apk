@@ -383,6 +383,87 @@ function upstreamSiteKey(source, site) {
   return source + ' :: ' + site.form + ' :: ' + (site.expression === undefined ? '<未解析>' : site.expression)
 }
 
+/** Audit a finite mobile Fetch factory that inherits the protected /api carrier. */
+function mobileFetchGroupIssues(row, source, upstreamRows) {
+  const issues = []
+  const clean = stripSourceComments(source)
+  const identifier = /^[A-Za-z_$][\w$]*$/
+  for (const field of ['endpointConstant', 'prefixConstant', 'factoryFunction', 'registrationFunction']) {
+    if (typeof row[field] !== 'string' || !identifier.test(row[field])) issues.push('invalid ' + field)
+  }
+  if (issues.length > 0) return issues
+  const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const endpointMatches = [...clean.matchAll(new RegExp('\\bconst\\s+' + escape(row.endpointConstant) + '\\s*=\\s*\\[([^\\]]*)\\]\\s*;', 'g'))]
+  let actual = []
+  if (endpointMatches.length !== 1) issues.push('endpoint array must have one declaration')
+  else {
+    const body = endpointMatches[0][1]
+    actual = [...body.matchAll(/(['"])([A-Za-z][A-Za-z0-9]*)\1/g)].map(match => match[2])
+    if (body.replace(/(['"])[A-Za-z][A-Za-z0-9]*\1/g, '').replace(/[\s,]/g, '') !== '') issues.push('endpoint array must contain only literal names')
+  }
+  const expected = Array.isArray(row.endpoints) ? row.endpoints : []
+  if (expected.length === 0 || expected.some(name => typeof name !== 'string' || !/^[A-Za-z][A-Za-z0-9]*$/.test(name))
+    || new Set(expected).size !== expected.length || new Set(actual).size !== actual.length
+    || JSON.stringify([...actual].sort()) !== JSON.stringify([...expected].sort())) issues.push('endpoint inventory drift')
+  const prefixes = [...clean.matchAll(new RegExp('\\bconst\\s+' + escape(row.prefixConstant) + '\\s*=\\s*(["\\\'])([^"\\\']*)\\1\\s*;', 'g'))]
+  if (typeof row.prefix !== 'string' || !/^[a-z][a-z0-9-]*\.$/.test(row.prefix)
+    || prefixes.length !== 1 || prefixes[0][2] !== row.prefix) issues.push('endpoint prefix drift')
+  const functionBody = (name) => {
+    const matches = [...clean.matchAll(new RegExp('\\bfunction\\s+' + escape(name) + '\\s*\\(', 'g'))]
+    if (matches.length !== 1) return null
+    const open = matches[0].index + matches[0][0].length - 1
+    const parameters = balancedGroup(clean, open)
+    if (parameters === null) return null
+    let bodyStart = open + parameters.length
+    while (/\s/.test(clean[bodyStart] ?? '') && bodyStart < clean.length) bodyStart += 1
+    return clean[bodyStart] === '{' ? balancedGroup(clean, bodyStart) : null
+  }
+  const factory = functionBody(row.factoryFunction)
+  const registration = functionBody(row.registrationFunction)
+  if (factory === null || !factory.includes('const method = `${' + row.prefixConstant + '}${endpoint}`;')
+    || !factory.includes('path: `/api/${method}`') || !/methods:\s*\[(['"])POST\1\]/.test(factory)
+    || !/requestBody:\s*(['"])buffered\1/.test(factory) || !factory.includes('if (envelope.method !== method)')) {
+    issues.push('Fetch factory path/method/envelope binding drift')
+  }
+  if (registration === null
+    || !/const\s+connection\s*=\s*[\w$]+\.get\((['"])connection\1\);/.test(registration)
+    || !registration.includes('const register = connection.fetch.register;')
+    || !registration.includes('for (const endpoint of ' + row.endpointConstant + ')')
+    || !registration.includes('register(' + row.factoryFunction + '(endpoint, handler))')
+    || [...registration.matchAll(/\bregister\s*\(/g)].length !== 1) issues.push('registration must bind only to connection.fetch')
+  if ([...clean.matchAll(/\.\s*fetch\s*\.\s*register\b/g)].length !== 1) issues.push('unreviewed extra or missing Fetch registration')
+  const carrier = upstreamRows.find(candidate => upstreamSiteKey(candidate.source, candidate) === row.guardedBy)
+  if (carrier?.verdict !== 'protected' || carrier.guardedBy !== undefined || carrier.pathText !== '/api'
+    || carrier.authCallMarker !== 'connection.admit(req)') issues.push('missing protected /api carrier judgment')
+  if (typeof row.evidence !== 'string' || row.evidence.trim().length < 30) issues.push('missing review evidence')
+  return issues
+}
+
+const mobileFetchGroups = Array.isArray(policy.mobileFetchGroups) ? policy.mobileFetchGroups : []
+const mobileFetchSources = new Set()
+for (const runtimeRoot of RUNTIME_ROOTS) {
+  const absolute = join(root, runtimeRoot.dir)
+  if (!existsSync(absolute)) continue
+  for (const file of walk(absolute)) {
+    const rel = relative(root, file).replace(/\\/g, '/')
+    if (runtimeRoot.include('/' + rel) && /\.\s*fetch\s*\.\s*register\b/.test(stripSourceComments(readFileSync(file, 'utf8')))) mobileFetchSources.add(rel)
+  }
+}
+const declaredFetchSources = new Set(mobileFetchGroups.map(row => row.source))
+check('mobile Fetch registration sources are fully inventoried',
+  declaredFetchSources.size === mobileFetchGroups.length
+    && [...mobileFetchSources].every(source => declaredFetchSources.has(source))
+    && [...declaredFetchSources].every(source => mobileFetchSources.has(source)),
+  'discovered=' + [...mobileFetchSources].join(', ') + '; declared=' + [...declaredFetchSources].join(', '))
+for (const row of mobileFetchGroups) {
+  check('mobile Fetch source matches packaged entry: ' + row.source,
+    typeof row.packageName === 'string' && /^[a-z0-9][a-z0-9-]*$/.test(row.packageName)
+      && typeof row.entryFile === 'string' && /^lib\/[A-Za-z0-9/_-]+\.js$/.test(row.entryFile)
+      && row.source === 'vendor/' + row.packageName + '/' + row.entryFile)
+  const issues = mobileFetchGroupIssues(row, read(row.source), policy.upstreamRoutes ?? [])
+  check('mobile Fetch routes inherit authenticated carrier: ' + row.source, issues.length === 0, issues.join('; '))
+}
+
 /** profile patch 里顶层（缩进 0）带 disabled: true 的行 id。 */
 function profileDisabledRowIds(text) {
   const ids = new Set()
@@ -644,11 +725,47 @@ if (snapshotIndex >= 0 && snapshotPath === undefined) {
           result.status === 0 && result.stdout.includes(entry.marker),
           result.status === 0 ? 'marker missing: ' + entry.marker : String(result.stderr ?? '').trim().slice(0, 180))
       }
+      for (const row of mobileFetchGroups) {
+        const tarPath = 'home/.dsh/profiles/' + profile + '/node_modules/' + row.packageName + '/' + row.entryFile
+        const artifact = spawnSync(TAR, ['-xOf', snapshotPath, tarPath], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 })
+        const issues = artifact.status === 0
+          ? mobileFetchGroupIssues(row, artifact.stdout, policy.upstreamRoutes ?? [])
+          : ['packaged Fetch source missing: ' + String(artifact.stderr ?? '').trim().slice(0, 180)]
+        check('post-injection Fetch auth: ' + profile + '/' + row.packageName + '/' + row.entryFile, issues.length === 0, issues.join('; '))
+      }
     }
   }
 }
 
 if (selfTest) {
+  const fetchRow = {
+    endpointConstant: 'ENDPOINTS', prefixConstant: 'PREFIX', prefix: 'fixture.', endpoints: ['read', 'write'],
+    factoryFunction: 'factory', registrationFunction: 'mount', evidence: 'finite POST-only Fetch routes inherit the reviewed authenticated /api carrier',
+    guardedBy: 'connection.ts :: web :: API_PATH',
+  }
+  const fetchCarriers = [{ source: 'connection.ts', form: 'web', expression: 'API_PATH', verdict: 'protected', pathText: '/api', authCallMarker: 'connection.admit(req)' }]
+  const fetchSource = [
+    'const ENDPOINTS = ["read", "write"];', 'const PREFIX = "fixture.";',
+    'function factory(endpoint, handler) { const method = `${PREFIX}${endpoint}`; return { path: `/api/${method}`, methods: ["POST"], requestBody: "buffered", fetch: async(request) => { if (envelope.method !== method) return; return handler(endpoint, envelope.payload, request.signal); } }; }',
+    'function mount(ctx) { const connection = ctx.get("connection"); const register = connection.fetch.register; for (const endpoint of ENDPOINTS) ctx.effect(() => register(factory(endpoint, handler))); }',
+  ].join('\n')
+  check('self-test(mobile Fetch): finite authenticated factory accepted', mobileFetchGroupIssues(fetchRow, fetchSource, fetchCarriers).length === 0)
+  check('self-test(mobile Fetch): accepts source mirror quotes and nested default parameters',
+    mobileFetchGroupIssues(fetchRow, fetchSource.replaceAll('"', "'")
+      .replace('function mount(ctx)', 'function mount(ctx, service = create(() => ({ ready: true })))'), fetchCarriers).length === 0)
+  for (const [label, changed] of [
+    ['extra endpoint', fetchSource.replace('["read", "write"]', '["read", "write", "erase"]')],
+    ['duplicate endpoint', fetchSource.replace('["read", "write"]', '["read", "read"]')],
+    ['dynamic endpoint', fetchSource.replace('["read", "write"]', '["read", ...OTHER]')],
+    ['changed prefix', fetchSource.replace('"fixture."', '"other."')],
+    ['webServer bypass', fetchSource.replace('connection.fetch.register', 'ctx.webServer.register')],
+    ['extra Fetch alias', fetchSource + '\nconst bypass = ctx.connection.fetch.register;'],
+    ['commented registration', fetchSource.replace('const register = connection.fetch.register;', '/* const register = connection.fetch.register; */')],
+    ['wrong endpoint binding', fetchSource.replace('if (envelope.method !== method)', 'if (false)')],
+  ]) check('self-test(mobile Fetch): rejects ' + label, mobileFetchGroupIssues(fetchRow, changed, fetchCarriers).length > 0)
+  check('self-test(mobile Fetch): rejects public or absent carrier',
+    mobileFetchGroupIssues(fetchRow, fetchSource, []).length > 0
+      && mobileFetchGroupIssues(fetchRow, fetchSource, [{ ...fetchCarriers[0], verdict: 'public' }]).length > 0)
   const longBody = 'x'.repeat(1024)
   const reordered = 'server.register({ path: "/api/self-test-unlisted", handler: () => ({ note: "' + longBody + '" }), kind: "exact" })'
   const commented = '/* server.register({ kind: "exact", path: "/api/commented-fake" }) */\nconst text = "server.register({ kind: \'prefix\', path: \'/api/string-fake\' })"'

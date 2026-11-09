@@ -471,7 +471,7 @@ class FactoryProfilePatchTest {
    * 真实工厂件（本仓镜像 `scripts/profile-web.cordis.patch.yml`）的**逐字节自一致**：
    * 零改动必须零重写。这是 D10 重写「块级 → 条目级」后最容易回归的性质——全文重建一旦漏字节，
    * 每次快照刷新都会无谓重写 patch（并可能把 CRLF/LF 与尾行吃掉）。
-   * 同时锁定工厂件的结构事实（21 个顶层条目；唯一多子条目组 = shell-termux + host-web-compat），
+   * 同时锁定工厂件的结构事实（25 个顶层块，含文件头注释块；唯一多子条目组 = shell-termux + host-web-compat），
    * 该事实是 P-1/P-2 触发的唯一靶子；工厂变了这里必须先红。
    * 条目数自 20 增至 22 是 0.14.2-fx-1 的产品改动：新增 `ptc-runtime` 行把 PTC 代码执行的
    * `nodeExecutable` 钉死——linker64 回落会把 process.execPath 污染成 linker64，堆参数被当成程序路径。
@@ -479,6 +479,9 @@ class FactoryProfilePatchTest {
    * 「disable 上游行 + 换 `agent-default-model-mobile` 新 id insert」两条顶层块，改为**同 id 就地
    * 覆盖 config**（一条顶层块）⇒ 顶层条目数少一条。旧写法使 session-controller 的
    * `agentDefaultModel` 供给依赖一条自定义 id 的条目，它 pending 即整个 session 面静默消失。
+   * 21 增至 24 是 Harness 0.2.2 的 Android 适配：显式禁用 desktop-product-telemetry、
+   * product-analytics、optional-terminal-pwsh 三个不属于 Android 运行环境的行。
+   * 24 增至 25：挂载 llm-subscriptions，提供订阅登录和同页自定义服务入口。
    */
   @Test
   fun realFactoryFileSelfMergeIsByteIdentical() {
@@ -493,7 +496,7 @@ class FactoryProfilePatchTest {
     assertTrue("零改动时不得有改动说明", result.changes.isEmpty())
 
     val blocks = FactoryProfilePatch.topLevelBlocks(text)
-    assertEquals("顶层条目数（工厂件结构改变时同步本断言）", 21, blocks.size)
+    assertEquals("顶层块数（含文件头注释块；工厂件结构改变时同步本断言）", 25, blocks.size)
     val groups = blocks.map { FactoryProfilePatch.blockIds(it) }.filter { it.size > 1 }
     assertEquals("唯一多子条目组 = shell-termux + host-web-compat", 1, groups.size)
     assertEquals(listOf("shell-termux", "host-web-compat"), groups.single())
@@ -502,7 +505,7 @@ class FactoryProfilePatchTest {
   /**
    * D10 的**真实形态**反证：拿仓库里的权威工厂件，人为抹掉 @BQ@host-web-compat@BQ@ 这一条
    * （设备上真实发生过的「同一组里少一个插件」形态），merge 必须把它补回**同一个** insert 组，
-   * 且其余 20 个顶层条目（21 - 1 = shell-termux 所在组）一字不动。
+   * 且其余 24 个顶层块（含文件头注释块；25 - 1 = shell-termux 所在组）一字不动。
    *
    * 旧实现在这里 @BQ@changes=0@BQ@ 且零日志：工厂件里 @BQ@shell-termux@BQ@ 已让该块被判定「存在」。
    */
@@ -524,7 +527,7 @@ class FactoryProfilePatchTest {
 
     assertTrue("D10：缺失的组内兄弟必须被补回", result.text.contains("id: host-web-compat"))
     assertTrue("补回的是同一个组（shell-termux 仍是组首）", result.text.contains("id: shell-termux"))
-    assertEquals("顶层条目数不变（补进组内，不是追加成新块）", 21, FactoryProfilePatch.topLevelBlocks(result.text).size)
+    assertEquals("顶层块数不变（补进组内，不是追加成新块）", 25, FactoryProfilePatch.topLevelBlocks(result.text).size)
     val group = FactoryProfilePatch.topLevelBlocks(result.text)
       .first { FactoryProfilePatch.blockIds(it).contains("shell-termux") }
     assertEquals(listOf("shell-termux", "host-web-compat"), FactoryProfilePatch.blockIds(group))

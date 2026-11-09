@@ -108,7 +108,7 @@ class UpdateManager(private val context: Context) {
         // Kill the old engine process: the EngineService watchdog restarts
         // it from the NEW usr within seconds.
         try {
-          Runtime.getRuntime().exec(arrayOf("/system/bin/pkill", "-f", "bin.js")).waitFor()
+          EngineManager(context).stopEngine(reason = "runtime-update", clearOrphans = true)
         } catch (_: Throwable) {
         }
         // Record the snapshot fingerprint: distinguishes an online update from the embedded assets

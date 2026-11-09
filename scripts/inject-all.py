@@ -12,7 +12,7 @@
 的 XZ_THREADS（默认 8，可由 DSH_CPU_THREADS 覆写）；本文件自身不调 xz（只做 lzma 流式重打包）。
 
 用法：
-  python inject-all.py <snapshot.tar.xz> <out.tar.xz> <authoritative.patch.yml> --dsh-android <dir>... --external <dir>... [--all-profiles]
+  python inject-all.py <snapshot.tar.xz> <out.tar.xz> <authoritative.patch.yml> --dsh-android <dir>... --external <dir>... [--all-profiles] [--browser-overlay <dir>]
 字节级 tar 流替换，保留 symlink 元数据（Windows bsdtar 解包 symlink 需特权——tar 流处理不物化）。
 
 装配 profile 覆盖（0.13.8-b ST-05 / F-ENV-02）：权威 patch 与注入包默认覆盖**全部**真实装配
@@ -20,11 +20,14 @@ profile（web + headless），不再只覆盖 web——见 PROFILES / NEGATIVE_C
 --all-profiles 为兼容保留的显式同义开关（历史上它是唯一开关且全仓无调用者）。
 """
 import io
+import hashlib
 import json as _json
 import lzma
 import os
+import re
 import sys
 import tarfile
+from pathlib import Path
 
 # 真实装配 profile（0.13.8-b ST-05 / F-ENV-02）：权威 patch 与注入包必须覆盖这里的每一个，
 # 否则 profile 的 cordis.patch.yml 会永久停在旧值（历史实证：headless 的 bashPath 停在
@@ -35,6 +38,87 @@ PROFILES = ("web", "headless")
 NEGATIVE_CONTROL_PROFILES = ("headless-bad",)
 DSH_ANDROID_NS = "node_modules/@dsh-android/"
 EXT_INCLUDE_FILES = ("package.json", "cordis.patch.yml", "spec.json", "README.md", "README.zh-CN.md", "LICENSE")
+APP_BOOT = "usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js"
+
+
+def browser_member_path(name):
+    """Canonical relative browser path; never allow an overlay outside this surface."""
+    while name.startswith("./"):
+        name = name[2:]
+    if not name or name.startswith("/") or "\\" in name or ":" in name \
+            or any(part in ("", ".", "..") for part in name.split("/")) \
+            or any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise ValueError("unsafe browser overlay member: " + repr(name))
+    if not (re.search(r"(^|/)dsh-web-frontend/dist/.*\.js$", name)
+            or re.search(r"(^|/)lib/client\.js$", name)):
+        raise ValueError("browser overlay cannot replace a non-browser member: " + name)
+    return name
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_browser_overlay(directory, archive):
+    """Admit only the pinned source archive and byte-checked, regular staging files."""
+    if directory is None:
+        return {}
+    root = Path(directory)
+    manifest_path = root / "browser-overlay.json"
+    if root.is_symlink() or not root.is_dir() or manifest_path.is_symlink():
+        raise ValueError("browser overlay must be a real directory with a regular manifest")
+    manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+    if type(manifest.get("version")) is not int or manifest["version"] != 1 \
+            or manifest.get("target") != "chrome87" or manifest.get("esbuildVersion") != "0.25.12" \
+            or not isinstance(manifest.get("files"), list):
+        raise ValueError("unknown browser overlay manifest/toolchain")
+    if manifest.get("archiveSha256") != sha256_file(archive):
+        raise ValueError("browser overlay source archive SHA256 mismatch")
+    result = {}
+    for row in manifest["files"]:
+        if not isinstance(row, dict) or not isinstance(row.get("path"), str):
+            raise ValueError("invalid browser overlay row")
+        name = browser_member_path(row["path"])
+        if name != row["path"] or name in result:
+            raise ValueError("duplicate or noncanonical browser overlay path: " + name)
+        for key in ("sourceSha256", "outputSha256"):
+            if not isinstance(row.get(key), str) or not re.fullmatch(r"[a-f0-9]{64}", row[key]):
+                raise ValueError("invalid browser overlay hash for " + name)
+        file = root / "files"
+        for part in name.split("/"):
+            if file.is_symlink():
+                raise ValueError("browser overlay paths may not traverse symlinks")
+            file = file / part
+        if file.is_symlink() or not file.is_file():
+            raise ValueError("browser overlay data must be a regular file: " + name)
+        data = file.read_bytes()
+        if hashlib.sha256(data).hexdigest() != row["outputSha256"]:
+            raise ValueError("browser overlay output SHA256 mismatch: " + name)
+        result[name] = {"sourceSha256": row["sourceSha256"], "data": data}
+    return result
+
+
+def rebase_assembled_manifest(data, injected_names):
+    """Preserve fail-loud ownership when a verified runtime receives local plugins."""
+    pattern = re.compile(rb"(?m)^const DSH_MOBILE_ASSEMBLED_MANIFEST = (\{[^\r\n]*\});\r?$")
+    matches = list(pattern.finditer(data))
+    if len(matches) != 1:
+        raise ValueError("app-boot G3 assembled manifest must have exactly one reviewed anchor")
+    match = matches[0]
+    manifest = _json.loads(match.group(1))
+    names = manifest.get("names")
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names) \
+            or not isinstance(manifest.get("complete"), bool):
+        raise ValueError("app-boot G3 assembled manifest shape changed")
+    # Keep every original owner. Only packages actually injected by this build gain
+    # product ownership; user-installed packages are never inferred from a prefix.
+    manifest["names"] = sorted(set(names).union(injected_names))
+    replacement = _json.dumps(manifest, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    return data[:match.start(1)] + replacement + data[match.end(1):]
 
 
 def parse_args(argv):
@@ -42,7 +126,7 @@ def parse_args(argv):
         print(__doc__)
         sys.exit(2)
     src, dst, patch_src = argv[1], argv[2], argv[3]
-    dsh_dirs, ext_dirs, all_profiles = [], [], False
+    dsh_dirs, ext_dirs, all_profiles, browser_overlay = [], [], False, None
     i = 4
     while i < len(argv):
         if argv[i] == "--dsh-android":
@@ -55,9 +139,13 @@ def parse_args(argv):
                 ext_dirs.append(argv[i]); i += 1
         elif argv[i] == "--all-profiles":
             all_profiles = True; i += 1
+        elif argv[i] == "--browser-overlay":
+            if browser_overlay is not None or i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                raise ValueError("--browser-overlay requires exactly one directory")
+            browser_overlay = argv[i + 1]; i += 2
         else:
             print("未知参数: " + argv[i]); sys.exit(2)
-    return src, dst, patch_src, dsh_dirs, ext_dirs, all_profiles
+    return src, dst, patch_src, dsh_dirs, ext_dirs, all_profiles, browser_overlay
 
 
 def build_dsh_replacements(pkg_dirs):
@@ -151,14 +239,19 @@ def match_ext(name, ext_names):
 
 
 def main():
-    src, dst, patch_src, dsh_dirs, ext_dirs, all_profiles = parse_args(sys.argv)
+    src, dst, patch_src, dsh_dirs, ext_dirs, all_profiles, browser_overlay = parse_args(sys.argv)
     preset = int(os.environ.get("DSH_INJECT_PRESET", "9"))
     with open(patch_src, "rb") as f:
         patch_bytes = f.read()
     dsh_repl = build_dsh_replacements(dsh_dirs)
     ext_repl = build_ext_replacements(ext_dirs)
+    browser_repl = load_browser_overlay(browser_overlay, src)
     dsh_names = set(dsh_repl.keys())
     ext_names = set(ext_repl.keys())
+    injected_names = {
+        _json.loads(files["package.json"])["name"]
+        for files in list(dsh_repl.values()) + list(ext_repl.values())
+    }
     # ST-05：权威 patch 与注入包的覆盖面 = 全部真实装配 profile（默认行为，不再只写 web）。
     target_profiles = list(PROFILES)
     print(f"inject-all: preset={preset} | assembly profiles: {target_profiles} "
@@ -173,6 +266,9 @@ def main():
     replaced = 0
     added_files = 0
     pruned = 0
+    browser_seen = set()
+    browser_applied = 0
+    browser_superseded = 0
     # 逐 profile 记账：包名可能与某个 profile 已在场、另一个 profile 缺席
     # （历史实证：headless 只有 3 个 @dsh-android 包，web 已有 8 个——旧的全局 seen 集合
     #  让「web 有就等于全树有」，缺席的 profile 永远补不上）。
@@ -224,8 +320,26 @@ def main():
 
         for member in tin:
             name = member.name
+            # Original tar metadata is authoritative. Never turn a link into a
+            # file, and validate even an overlay superseded by a local plugin.
+            canonical_name = name
+            while canonical_name.startswith("./"):
+                canonical_name = canonical_name[2:]
+            browser = browser_repl.get(canonical_name)
+            if browser is not None:
+                if canonical_name in browser_seen or not member.isfile():
+                    raise ValueError("browser overlay target is duplicate or non-regular: " + name)
+                browser_seen.add(canonical_name)
+                if hashlib.sha256(tin.extractfile(member).read()).hexdigest() != browser["sourceSha256"]:
+                    raise ValueError("browser overlay member source SHA256 mismatch: " + name)
             if member.isfile():
                 data = None
+                if name == APP_BOOT:
+                    data = rebase_assembled_manifest(tin.extractfile(member).read(), injected_names)
+                    push(data, name, int(member.mtime))
+                    replaced += 1
+                    print("  app-boot ownership aligned with injected plugins")
+                    continue
                 # 修剪：工厂包目录内、源包已不存在的成员一律丢弃（否则「注入后 == 源包」不成立）
                 fr = factory_rel(name)
                 if fr is not None:
@@ -233,6 +347,8 @@ def main():
                     fr_pool = dsh_repl if fr_pkg in dsh_names else ext_repl
                     if fr_rel not in fr_pool.get(fr_pkg, {}):
                         pruned += 1
+                        if browser is not None:
+                            browser_superseded += 1
                         if fr_pkg == "dsh-client-ui-responsive" or pruned <= 3:
                             print(f"  [prune] {fr_prof}: {fr_pkg}/{fr_rel}（源包已删）")
                         continue
@@ -245,6 +361,8 @@ def main():
                     # 无论是否替换，都把「基座里见到的该包 rel」记账：循环后据此补新增文件。
                     seen_rels.setdefault((prof, pkg), set()).add(rel)
                     if data is not None:
+                        if browser is not None:
+                            browser_superseded += 1
                         prof_seen = (seen_dsh if pkg in dsh_names else seen_ext)
                         prof_seen.setdefault(prof, set()).add(pkg)
                         push(data, name, int(member.mtime))
@@ -259,6 +377,13 @@ def main():
                         print("  patch replaced:", name)
                         continue
                     print("  skip (not an assembly profile):", name)
+                # Local plugin replacements and pruning above win over the old
+                # archive's browser bytes. Only remaining base members use this
+                # overlay; no second tar compression or whole-tree extraction.
+                if browser is not None:
+                    data = browser["data"]
+                    browser_applied += 1
+                    replaced += 1
                 if data is None:
                     # 流式复制 + 只读前 4 字节判定权限（勿整文件读进内存：51k 文件 / 743MB 白花几分钟）
                     handle = tin.extractfile(member)
@@ -269,6 +394,9 @@ def main():
                     tout.addfile(member, handle)
                 else:
                     member.mode = mode_for(data)
+                    member.size = len(data)
+                    if "size" in member.pax_headers:
+                        member.pax_headers["size"] = str(member.size)
                     tout.addfile(member, io.BytesIO(data))
             else:
                 if member.isdir():
@@ -276,6 +404,10 @@ def main():
                     seen_dirs.add(name)
                 # symlink/dir/hardlink：无内容，元数据原样复制
                 tout.addfile(member)
+
+        missing_browser = set(browser_repl) - browser_seen
+        if missing_browser:
+            raise ValueError("browser overlay targets absent from source archive: " + ", ".join(sorted(missing_browser)))
 
         # 追加模式：快照内不存在的包 → 落到**每一个**装配 profile（ST-05：只落 web 会让
         # headless 缺包，权威 patch 覆盖过去后 headless 装配失败；目录项一并生成）。
@@ -340,6 +472,8 @@ def main():
     with lzma.open(dst, "wb", preset=preset) as f:
         f.write(outbuf.getvalue())
     print(f"replaced entries: {replaced} | added files: {added_files} | pruned stale: {pruned} | preset={preset}")
+    if browser_overlay is not None:
+        print(f"browser overlay: applied={browser_applied} | superseded by local plugins={browser_superseded} | declared={len(browser_repl)}")
     print("written:", dst, os.path.getsize(dst), "bytes")
 
 

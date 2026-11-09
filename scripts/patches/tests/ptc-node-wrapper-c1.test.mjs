@@ -4,12 +4,12 @@
 // 真因：PTC 给子进程传的是**显式过滤后的 env**（ptc-runtime-node 的 STARTUP_ENVIRONMENT_NAMES 只放
 // PATH/PATHEXT/SYSTEMROOT/WINDIR/TEMP/TMP），LD_LIBRARY_PATH 不在其中 ⇒ 子进程里的 node 找不到
 // libz.so.1 等 DT_NEEDED（Permissive 报 CANNOT LINK；Enforcing 真机 app 域 exec app-data ELF 被拒 ⇒ EACCES）。
-// 修法 C1：nodeExecutable 指向**快照内的 wrapper 脚本**（非 ELF ⇒ 走 shebang 不触发 app-data ELF exec；
+// 修法 C1：nodeExecutable（0.2.1 起为 launch.executable）指向**快照内的 wrapper 脚本**（非 ELF ⇒ 走 shebang 不触发 app-data ELF exec；
 // wrapper 自己 export LD_LIBRARY_PATH ⇒ 不依赖被 tombstone 的继承；linker64 只读取 node 而非 exec）。
 //
 // 本测试锁四件事（都对**仓库源文件**断言，不需要设备/构建）：
 //  ① build-snapshot 生成 wrapper（含正确三行、可执行位、设备路径而非本地 stage 路径）；
-//  ② profile 的 nodeExecutable 指向该 wrapper；
+//  ② profile 的 launch.executable 指向该 wrapper（kind: node-script）；
 //  ③ **反证**：PTC 子进程 env 白名单里不得出现 TERMUX_APP__LEGACY_DATA_DIR
 //     （tombstone 残留 + 防「钩子把 wrapper 自己也重定向」这一**未复现但未排除**的风险）；
 //  ④ wrapper 就位后，profile 不得再指向裸 bin/node（否则修法被无声回退）。
@@ -30,6 +30,19 @@ function check(label, ok, detail) {
 }
 
 const BUILD = join(repoRoot, 'scripts', 'build-snapshot-013.mjs')
+
+/**
+ * 取 build-snapshot 里 **7c1 PTC wrapper 段**的源码（从段标题到下一个 `──` 段标题）。
+ *
+ * 为什么要切段而不是全文件断言：`NEW_PREFIX` 在别处（relocate-snapshot / fix-shebang 调用）**仍然合法**
+ * ——shebang 面无法自定位，只能靠运行期重写（见 SnapshotPrefixRewrite.kt）。判据只该管 wrapper 这一段。
+ */
+const wrapperSectionOf = (text) => {
+  const start = text.indexOf('const PTC_NODE_WRAPPER_REL')
+  if (start < 0) return ''
+  const end = text.indexOf('\n// ──', start)
+  return end < 0 ? text.slice(start) : text.slice(start, end)
+}
 const PROFILE = join(repoRoot, 'scripts', 'profile-web.cordis.patch.yml')
 const WRAPPER_REL = 'libexec/dsh-node'
 const PREFIX = '/data/data/com.dsharnessmobile.shell/files/usr'
@@ -37,23 +50,65 @@ const PREFIX = '/data/data/com.dsharnessmobile.shell/files/usr'
 const build = readFileSync(BUILD, 'utf8')
 const profile = readFileSync(PROFILE, 'utf8')
 
+/** 取 YAML 顶层 "- id: <id>" 条目正文（到下一个顶层条目前）。 */
+function yamlEntry(text, id) {
+  const match = new RegExp('^- id: ' + id + '\\n([\\s\\S]*?)(?=^- )', 'm').exec(text)
+  return match ? match[1] : ''
+}
+/** 取某条目下一层映射的键行（去缩进，形如 "kind: node-script"）。 */
+function mappingLines(block, key) {
+  const lines = block.split(/\r?\n/)
+  const start = lines.findIndex((line) => line.trim() === key + ':')
+  if (start < 0) return []
+  const indent = lines[start].match(/^[ \t]*/)[0].length
+  const out = []
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() === '') continue
+    const lineIndent = line.match(/^[ \t]*/)[0].length
+    if (lineIndent <= indent) break
+    out.push(line.trim())
+  }
+  return out
+}
+
 // ① wrapper 生成
 check('build-snapshot 生成 PTC wrapper（7c1 段在场）', build.includes('PTC node wrapper'))
 check('wrapper 落点为 usr/libexec/dsh-node', build.includes("const PTC_NODE_WRAPPER_REL = 'libexec/dsh-node'"))
+// 窗口从 400 放宽到 2000：wrapper 内容会随功能增长（0.14.8 加了堆下限段），
+// 而本判据要守的是「同一个 writeFileSync 落了 mode 0o755」，不是「内容必须短」。
+// 旧窗口是恒定量，内容一长就假红（实测 0.14.8 堆下限把三段挤到 400 之外）。
 check('wrapper 带可执行位（mode 0o755）',
-  /writeFileSync\(\s*\n?\s*join\(U, PTC_NODE_WRAPPER_REL\)[\s\S]{0,400}?\{ mode: 0o755 \}/.test(build))
-check('wrapper 用 /system/bin/sh shebang', build.includes("'#!/system/bin/sh\\n'"))
-check('wrapper 内部 export LD_LIBRARY_PATH 指向快照 lib', build.includes("'export LD_LIBRARY_PATH=\"' + NEW_PREFIX + '/lib\"\\n'"))
+  /writeFileSync\(\s*\n?\s*join\(U, PTC_NODE_WRAPPER_REL\)[\s\S]{0,2000}?\{ mode: 0o755 \}/.test(build))
+// issue #1234：wrapper 的前缀不再烧 NEW_PREFIX（构建期事实），改为运行期由 $0 自定位。
+// 判据随之从「烧的是设备路径而不是本地 stage 路径」升级为「根本不许烧任何设备前缀 + 必须自定位」：
+// 前者在单用户设备上够用，在多用户设备上（user 10）必 exit 127。
+check('wrapper 用 /system/bin/sh shebang', build.includes("'#!/system/bin/sh'"))
+check('wrapper 内部 export LD_LIBRARY_PATH 指向快照 lib（相对自定位前缀）',
+  build.includes("'export LD_LIBRARY_PATH=\"$prefix/lib\"\\n'"))
 check('wrapper 经 /system/bin/linker64 启动 node（绕开 app-data ELF exec）',
-  build.includes("'exec /system/bin/linker64 \"' + NEW_PREFIX + '/bin/node\" \"$@\"\\n'"))
-check('wrapper 只烧设备路径、不烧构建期本地路径（NEW_PREFIX 而非 join(U, …)）',
-  build.includes("'export LD_LIBRARY_PATH=\"' + NEW_PREFIX") && build.includes("'exec /system/bin/linker64 \"' + NEW_PREFIX"))
+  build.includes("'exec /system/bin/linker64 \"$prefix/bin/node\" \"$@\"\\n'"))
+check('wrapper 自定位前缀由 $0 推导（prefix=$(cd … && pwd)）',
+  build.includes("'prefix=$(cd \"$(dirname \"$self\")/..\" && pwd)'"))
+check('wrapper 不得烧任何构建期设备前缀（含 NEW_PREFIX 与本地 stage 路径）',
+  // 只判**代码行**：段内注释会点名 NEW_PREFIX 说明「原先烧的是它」，那是解释不是实现。
+  !wrapperSectionOf(build)
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*\/\//.test(line))
+    .some((line) => /NEW_PREFIX/.test(line)))
 
-// ② profile 接线
-check('profile 的 nodeExecutable 指向 wrapper',
-  profile.includes('nodeExecutable: ' + PREFIX + '/' + WRAPPER_REL))
+// ② profile 接线（0.2.1-rc.2：上游删除 nodeExecutable，改为必填 launch:{kind,executable}）
+const ptcEntry = yamlEntry(profile, 'ptc-runtime')
+const launchLines = mappingLines(ptcEntry, 'launch')
+check('profile 的 ptc-runtime 使用 launch 联合类型，kind 为 node-script',
+  launchLines.includes('kind: node-script'))
+check('profile 的 launch.executable 指向 wrapper',
+  launchLines.includes('executable: ' + PREFIX + '/' + WRAPPER_REL))
+check('launch 只保留已审阅的 kind/executable 两个键',
+  launchLines.length === 2)
+check('profile 不再残留旧键 nodeExecutable（0.2.1 已删除）',
+  !/^\s*nodeExecutable\s*:/m.test(ptcEntry))
 check('profile 不再指向裸 bin/node（修法未被无声回退）',
-  !profile.includes('nodeExecutable: ' + PREFIX + '/bin/node'))
+  !launchLines.includes('executable: ' + PREFIX + '/bin/node'))
 check('profile 记录了 C1 的逆转条件（上游补白名单后可改回）',
   profile.includes('逆转条件：上游把 LD_LIBRARY_PATH'))
 
@@ -73,6 +128,26 @@ check('wrapper 不依赖 LD_PRELOAD / TERMUX_EXEC__* 继承（只靠自 export�
   !/LD_PRELOAD|TERMUX_EXEC__/.test(wrapperBlock))
 check('wrapper 不引用 TERMUX_APP__LEGACY_DATA_DIR（防「钩子重定向 wrapper 自身」的未复现风险）',
   !wrapperBlock.includes('TERMUX_APP__LEGACY_DATA_DIR'))
+
+// ③-b 0.14.8 堆下限：wrapper 是「被过滤 env」那条路径上唯一的堆来源
+// （PTC 只放 6 个环境变量，壳侧 shellEnv() 的 NODE_OPTIONS 到不了它）。
+// 判据三条：未设时自适应填值 / 用前先判空（不得覆盖调用方显式值）/ 落在 exec 之前才生效。
+check('wrapper 在 NODE_OPTIONS 未设置时才填堆下限（不得覆盖调用方显式值）',
+  wrapperBlock.includes('if [ -z "$NODE_OPTIONS" ]; then'))
+check('wrapper 按设备 MemTotal 自适应算堆（clamp 到 512-4096MB）',
+  wrapperBlock.includes('/proc/meminfo') &&
+    /__dsh_mem_kb \/ 2048/.test(wrapperBlock) &&
+    wrapperBlock.includes('[ "$__dsh_heap" -lt 512 ]') &&
+    wrapperBlock.includes('[ "$__dsh_heap" -gt 4096 ]'))
+// 上限 1024 是 0.14.8 的真实缺陷：它正好是 V8 自然上限（1120MB）对应的标志档，
+// 于是 MemTotal/2 分支在所有真机上被截断，自适应形同虚设（社区反馈「只能提上限」）。
+// 这条判据让该缺陷在 wrapper 侧也判红，而不只在 Kotlin 侧。
+check('wrapper 上限不得退化成 1024（否则 /2 分支在真机上恒被截断）',
+  !wrapperBlock.includes('[ "$__dsh_heap" -gt 1024 ]') &&
+    !/__dsh_heap=1024\b/.test(wrapperBlock))
+check('wrapper 导出的堆标志落在 exec 之前（否则对本次进程无效）',
+  wrapperBlock.indexOf('export NODE_OPTIONS=') >= 0 &&
+    wrapperBlock.indexOf('export NODE_OPTIONS=') < wrapperBlock.indexOf('exec /system/bin/linker64'))
 
 // ④ 双仓镜像：apk 侧同一文件必须含同一 wrapper 落点（防单边演进）
 const apkBuild = join(repoRoot, 'dsh-mobile-apk', 'scripts', 'build-snapshot-013.mjs')

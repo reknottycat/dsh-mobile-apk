@@ -112,6 +112,30 @@
         "file": "dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/EngineStartFlow.kt",
         "pattern": "ENGINE_BOOT_BUDGET_MS"
       }
+    },
+    {
+      "id": "engine-lifecycle-generation",
+      "holder": "壳侧 EngineManager 进程级状态",
+      "writePath": "dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/EngineManager.kt",
+      "sourceOfTruth": "当前受管进程与启动/停止请求代次；HTTP 实测与鉴权状态独立",
+      "syncPath": "启动流、服务、监听观察和日志读取持有 expectedGeneration；复探及终止前比较当前代次；EngineRecoveryGuardTest 和 EngineProbeHttpTest 提供反证",
+      "evidence": {
+        "kind": "grep",
+        "file": "dsh-mobile-apk/app/src/main/java/com/dsharnessmobile/shell/EngineManager.kt",
+        "pattern": "expectedGeneration"
+      }
+    },
+    {
+      "id": "codex-custom-provider",
+      "holder": "订阅插件表单、Harness settings 与私有 credentials 服务",
+      "writePath": "vendor/dsh-plugin-subscriptions/lib/codex-custom.js:createCodexCustomService",
+      "sourceOfTruth": "llm-pi-ai.providers.codex-custom 的 revision 受控配置及随机独立 API key 引用；OAuth 记录不参与",
+      "syncPath": "受保护 Fetch RPC 读取无密钥的视图；保存先暂存独立密钥再按 expectedRevision 提交，异常后读回；表单保存后刷新配置并清空 key，生产协议测试验证实际 HTTP 使用该配置",
+      "evidence": {
+        "kind": "grep",
+        "file": "vendor/dsh-plugin-subscriptions/lib/codex-custom.js",
+        "pattern": "expectedRevision"
+      }
     }
   ]
 }
