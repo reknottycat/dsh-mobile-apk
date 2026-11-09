@@ -13,11 +13,23 @@ jobs:
     env:
       DSH_APK_DIR: ${{ github.workspace }}
     steps:
+      # This historical audit reconstructs 0.1.7-rc.2 from source. Do not silently
+      # combine that identity with this fork's new 0.2.2 runtime contract.
       - name: Checkout project source without Git LFS runtime archives
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           lfs: false
+
+      - name: Check historical source-build identity
+        run: |
+          python3 - <<'PYCODE'
+          import json
+          contract = json.load(open('scripts/contract.json'))
+          expected = '477b4f420553e8a52c2fbccc464d7561b239c443'
+          if contract['upstream']['commit'] != expected:
+              raise SystemExit('This historical source audit is pinned to Harness 0.1.7-rc.2. Use build-apk for the current verified-runtime build; a full 0.2.2 source rebuild requires a separately verified source chain.')
+          PYCODE
 
       - name: Prepare build tools
         uses: actions/setup-node@v4

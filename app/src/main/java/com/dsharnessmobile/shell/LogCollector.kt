@@ -123,6 +123,7 @@ object LogCollector {
   /** C1：首个 HTTP 响应相对 LISTEN 的允许超出量（详档 §5.1 C1 明文要求的硬判据）。 */
   internal const val HTTP_OVER_LISTEN_BUDGET_MS = 1_000L
 
+  @Volatile private var segGeneration = 0L
   @Volatile private var segBootStartMs = 0L
   @Volatile private var segListenMs = 0L
   @Volatile private var segComposeTotalMs = -1L
@@ -243,7 +244,9 @@ object LogCollector {
    * 引擎启动请求（EngineManager.startWithArgs 的 spawn 点）：重置本世代并**立即落一行**
    * `note=boot-start`——引擎随后即使启动失败、端口从未应答，三字段也已经在判据文件里。
    */
+  @Synchronized
   fun markBootStart(context: Context) {
+    segGeneration = EngineManager.currentGeneration()
     segBootStartMs = System.currentTimeMillis()
     segListenMs = 0L
     segComposeTotalMs = -1L
@@ -253,7 +256,7 @@ object LogCollector {
     // （乙）解析链必须与调试日志采集器**解耦**：采集器默认关闭，旧实现把探针解析只挂在 tick()
     // 里 ⇒ 默认设备上即使探针在场也永远落不出 t_compose_total（恒 -1 的第二半成因）。这里起一条
     // 有界轻量 tail，只在本次启动窗口内观察 engine.log，绝不依赖任何用户开关。
-    startProbeTail(context.applicationContext)
+    startProbeTail(context.applicationContext, segGeneration)
   }
 
   // ── 探针 tail（与采集器开关解耦；有界）────────────────────────────────────
@@ -263,35 +266,33 @@ object LogCollector {
   // 不向 engine.log 写一个字（r10 实测教训：壳侧追加会被引擎从它自己的偏移整行覆盖）。
   //
   // 有界性：单世代最长 PROBE_WINDOW_MS、每 PROBE_POLL_MS 一读、读完 TOTAL 后再多读一轮即停；
-  // 线程数恒 ≤1（同一世代的重复调用被 @Volatile 守卫），daemon，不影响进程退出。
+  // 每代一个 daemon；新代启动后旧观察者按 generation 自行退出，偏移互不共享。
   private const val PROBE_WINDOW_MS = 90_000L
   private const val PROBE_POLL_MS = 500L
 
-  /** 探针 tail 的独立读偏移（**不得**复用 tick() 的 engineLogOffset，两者可同时运行）。 */
-  private var probeOffset = 0L
-
-  @Volatile private var probeTailRunning = false
+  // Each generation owns its tail offset; an earlier thread cannot consume the next log.
 
   /**
    * 探针 tail 主体：把 engine.log 的新增内容喂给 [maybeEmitComposeTotal]，使 `t_compose_total`
    * 在任何设备上都能落真实值（只要引擎侧探针在场）。抽成可注入形态以便 JVM 单测覆盖「读到即落盘」
    * 与「无探针时不得编造」两条。
    */
-  private fun startProbeTail(ctx: Context) {
-    if (probeTailRunning) return
-    probeTailRunning = true
-    probeOffset = 0L
+  private fun startProbeTail(ctx: Context, generation: Long) {
     Thread {
+      var probeOffset = 0L
       try {
-        val deadline = System.currentTimeMillis() + PROBE_WINDOW_MS
+        val deadline = android.os.SystemClock.elapsedRealtime() + PROBE_WINDOW_MS
         var sawProbe = false
         var graceAfterProbe = 0
-        while (System.currentTimeMillis() < deadline) {
+        while (android.os.SystemClock.elapsedRealtime() < deadline && generation == EngineManager.currentGeneration()) {
           val text = readEngineLogFrom(ctx, probeThreshold = probeOffset, advanced = { probeOffset = it })
           if (text.isNotEmpty()) {
             val source = composeProbeSource(text)
-            if (source != SOURCE_NONE) segComposeSource = source
-            maybeEmitComposeTotal(ctx, text)
+            synchronized(this@LogCollector) {
+              if (generation != segGeneration || generation != EngineManager.currentGeneration()) return@Thread
+              if (source != SOURCE_NONE) segComposeSource = source
+              maybeEmitComposeTotal(ctx, text, generation)
+            }
             if (source == SOURCE_PRELOAD) {
               // TOTAL 是 last-wins 汇总：见到就再多读一轮（抓同一批里的最终值）然后收工。
               sawProbe = true
@@ -314,16 +315,16 @@ object LogCollector {
         //  - 只见到 A5/A3 等**不含耗时**的证据 → note=probe-no-total source=<a5-singles|a3-cache-only …>
         //    （探针装了、但没有任何口径能给出耗时）
         //  - 什么都没见到 → note=probe-absent source=none（探针完全没装）
-        if (!sawProbe) {
-          val note = if (segComposeSource == SOURCE_NONE) "probe-absent" else "probe-no-total"
-          emitBootSegments(ctx, note + " source=" + segComposeSource)
+        synchronized(this@LogCollector) {
+          if (!sawProbe && generation == segGeneration && generation == EngineManager.currentGeneration()) {
+            val note = if (segComposeSource == SOURCE_NONE) "probe-absent" else "probe-no-total"
+            emitBootSegments(ctx, note + " source=" + segComposeSource)
+          }
         }
       } catch (t: Throwable) {
         Log.w(TAG, "probe tail failed: " + (t.message ?: t.javaClass.simpleName))
-      } finally {
-        probeTailRunning = false
       }
-    }.apply { isDaemon = true; name = "dsh-boot-probe-tail" }.start()
+    }.apply { isDaemon = true; name = "dsh-boot-probe-tail-$generation" }.start()
   }
 
   /**
@@ -360,8 +361,9 @@ object LogCollector {
    * 为什么这个口径今天就能产出真实值：它完全在**壳侧**可测——由壳的探活自己的时间戳定义，不依赖引擎
    * 侧任何插桩（与 t_compose_total 的困境相反）。幂等；未知时如实 -1。
    */
-  fun markFirstHttp(context: Context) {
-    if (segFirstHttpMs > 0L) return
+  @Synchronized
+  fun markFirstHttp(context: Context, generation: Long = EngineManager.currentGeneration()) {
+    if (generation != segGeneration || generation != EngineManager.currentGeneration() || segFirstHttpMs > 0L) return
     segFirstHttpMs = System.currentTimeMillis()
     emitBootSegments(context, "note=first-http")
   }
@@ -375,15 +377,17 @@ object LogCollector {
    * 非本壳发起的启动（segBootStartMs == 0，例如进程内接手已在跑的引擎）同样落盘：
    * t_boot_start 记 -1，而不是整行消失——判据是「三字段在场」，未知必须显式标注。
    */
-  fun markListen(context: Context) {
-    if (segListenMs > 0L) return
+  @Synchronized
+  fun markListen(context: Context, generation: Long = EngineManager.currentGeneration()) {
+    if (generation != segGeneration || generation != EngineManager.currentGeneration() || segListenMs > 0L) return
     segListenMs = System.currentTimeMillis()
     emitBootSegments(context, "note=listen")
   }
 
   /** 探针 TOTAL 出现/更新时补落一行（真实 t_compose_total）。 */
-  private fun maybeEmitComposeTotal(ctx: Context, engineText: String) {
-    if (segListenMs <= 0L) return
+  @Synchronized
+  private fun maybeEmitComposeTotal(ctx: Context, engineText: String, generation: Long) {
+    if (generation != segGeneration || generation != EngineManager.currentGeneration() || segListenMs <= 0L) return
     val source = composeProbeSource(engineText)
     if (source != SOURCE_NONE) segComposeSource = source
     val total = parseComposeTotalMs(engineText) ?: return
@@ -392,9 +396,9 @@ object LogCollector {
     emitBootSegments(ctx, "note=compose-total")
   }
 
+  @Synchronized
   private fun emitBootSegments(ctx: Context, note: String) {
-    val line = bootSegmentsLine(segBootStartMs, segListenMs, segComposeTotalMs, segFirstHttpMs, segComposeSource) +
-      " " + note
+    val line = bootSegmentsSnapshot() + " " + note
     if (executor != null) {
       try {
         appendToDayFile(ctx, line + "\n")
@@ -772,8 +776,9 @@ object LogCollector {
     (message ?: "").trimStart().startsWith(PAGE_STALL_PREFIX)
 
   /** 当前分段判据快照（诊断行/自检面共用；未知一律 -1）。 */
+  @Synchronized
   internal fun bootSegmentsSnapshot(): String =
-    bootSegmentsLine(segBootStartMs, segListenMs, segComposeTotalMs, segFirstHttpMs, segComposeSource)
+    bootSegmentsLine(segBootStartMs, segListenMs, segComposeTotalMs, segFirstHttpMs, segComposeSource) + " boot_generation=" + segGeneration
 
   /**
    * Write shell events directly (no logcat dependency — on MuMu/Android 15 logd blocks logcat reads
@@ -811,10 +816,11 @@ object LogCollector {
     try {
       val sb = StringBuilder()
       sb.append(readLogcat())
+      val generation = EngineManager.currentGeneration()
       val engineText = readEngineLog(ctx)
       sb.append(engineText)
       // P-AC-04：探针口径一到就补落真实 t_compose_total（落壳侧判据文件，绝不写 engine.log）。
-      maybeEmitComposeTotal(ctx, engineText)
+      maybeEmitComposeTotal(ctx, engineText, generation)
       if (sb.isEmpty()) return
       appendToDayFile(ctx, sb.toString())
     } catch (t: Throwable) {

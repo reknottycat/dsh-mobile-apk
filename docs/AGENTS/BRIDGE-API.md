@@ -15,12 +15,12 @@
 
 - **角色**：DeepSeek Harness 安卓壳应用（包名 `com.dsharnessmobile.shell`）。
 - **职责边界**：只保留安卓平台权能与桥——前台服务、看门狗、WebView、SAF 桥、快照解压与更新、崩溃回退闸门（UndoGate）、ADB 授权原生写面（AdbState）、审计、内置控制台、日志。**AI 可见能力全部来自插件**。
-- **运行时形态**：壳内嵌 Termux 运行时快照（`assets/snapshot.tar.xz` → `files/usr` + `files/home`）；引擎（Node.js `@deepseek-ai/dsh`，基线 0.1.5-rc.1）监听 `127.0.0.1:3080`；WebView 加载引擎 Web UI。
+- **运行时形态**：壳内嵌 Termux 运行时快照（`assets/snapshot.tar.xz` → `files/usr` + `files/home`）；引擎（Node.js `@deepseek-ai/dsh`，基线 0.2.2-rc.1）监听 `127.0.0.1:3080`；WebView 加载引擎 Web UI。
 - **构建链**：minSdk 26 / targetSdk 34 / compileSdk 36；Kotlin 2.0.21；AGP 8.8.2；Java 17。
 - **依赖**：androidx.activity-ktx / core-ktx、dynamicanimation、commons-compress、xz；Shizuku `dev.rikka.shizuku:api/provider 13.1.5`（ShizukuTransport/ShizukuUserService 直连；ShizukuSupport/ShizukuProbe 仍反射探活）。
-- **兄弟仓库**（协调仓库下的子目录）：`dsh-shell-termux`（0.2.0，Termux 执行器 + 工具链单一表）、`dsh-client-ui-responsive`（0.3.3，移动 UI 注入层 + F5 消费端）、`dsh-host-web-compat`（0.1.13，页面注入/兼容）、`plugins/`（bridge 0.2.4 / manage 0.3.0 / model-capability 0.2.1 / file-open 0.1.0 / browser 0.1.0 / linux-env 0.1.2 / vdisplay 0.1.0，协调仓库内）、`vendor/`（dshmarketplace-plugin、dsh-undo-savepoint 固化副本 + PATCHES.md）。
+- **兄弟仓库**（协调仓库下的子目录）：`dsh-shell-termux`（0.2.0，Termux 执行器 + 工具链单一表）、`dsh-client-ui-responsive`（0.3.3，移动 UI 注入层 + F5 消费端）、`dsh-host-web-compat`（0.1.16，页面注入/兼容）、`plugins/`（bridge 0.2.4 / manage 0.3.0 / model-capability 0.2.1 / file-open 0.1.0 / browser 0.1.0 / linux-env 0.1.2 / vdisplay 0.1.0，协调仓库内）、`vendor/`（dshmarketplace-plugin、dsh-undo-savepoint 固化副本 + PATCHES.md）。
 - **上游** `deepseek-ai/deepseek-harness`（本地 checkout `dsh/`）：只读参考，**零改动**；一切适配以补丁层/插件/壳侧实现。
-- **版本状态**：**0.14.0-preview 已发布（vc38，2026-09-13，9 资产）**；0.13.8（vc37，2026-09-12，16 资产）为上一版。工作区在 0.14.0-preview 上继续施工 Shizuku 特权 transport / 虚拟屏 listener viewer / 隔离 BrowserHost / 开放屏幕范围（未提交、未验收）。开放 issue 与对账见 apk 仓 issue 列表与协调仓 `docs/0.14.0-preview-ISSUE-RECONCILIATION.md`。
+- **版本状态**：当前修复分支为 **0.14.12-bootfix.1（versionCode 71）**，从本仓 0.14.2-fx-2 选择性升级至 Harness 0.2.2-rc.1，并修复启动恢复误判；具体构建与设备验收记录见 `release/v0.14.12-bootfix.1/notes.md`。历史发布记录见 `changelog-archive.md`。
 - **环境无关声明**：本文档适用于任意环境（Windows/WSL/Linux/macOS、有/无真机）开发维护者；环境差异点（WSL、ADB 真机、run-as）已在对应章节标注。
 
 ## 2. 构建与验证命令
@@ -224,7 +224,7 @@ cd ..\plugins\dsh-android-<pkg> && npm run build
 | 页面 → 壳 | ~~`pickImage(callbackId)`~~ | 已删除（AndroidBridge/MainActivity/ConfigTransfer 图片桥） | 上游 0.1.5 自带附件入口（回形针 → 系统文件选择器 → 官方上传接口）替代 |
 | 页面 → 壳 | ~~`pickFilePath(callbackId)`~~ | 已删除（AndroidBridge / MainActivity / ConfigTransfer 的 SAF 文档选择链 + 页面 `onFilePicked`） | 0.13.7fx-1 退役：`@` 文件引用回到上游原生菜单（`ui-input-trigger` + `ui-reference`，候选限定在会话工作区内），自建 `@路径` 桥不再需要 |
 | 壳 → 页面 | ~~`window.__dshBridge.onImagePicked`~~ | 已删除（dsh-host-web-compat lib/index.js） | 同上 |
-| 页面 → 壳 | `settingsPath()` | AndroidBridge.kt（新增）→ EngineManager.settingsDocumentPath() | Host 设置文档绝对路径（`$DSH_HOME/settings.yaml`），空串 = 文件不存在。移动适配层用它把上游「打开配置文件」（本来走 mac/win/linux 原生编辑器，Android 必然失败，apk #152）改走系统选择器 |
+| 页面 → 壳 | `settingsPath()` | AndroidBridge.kt（新增）→ EngineManager.settingsDocumentPath() | 活动设置文档绝对路径：未迁移时为 `$DSH_HOME/settings.yaml`，迁移后为 `$DSH_HOME/profiles/web/cordis.patch.yml`，空串 = 文件不存在。移动适配层用它把上游「打开配置文件」（本来走 mac/win/linux 原生编辑器，Android 必然失败，apk #152）改走系统选择器 |
 | 页面（兼容插件） | `window.__dshOpenPath(path, mode)` | dsh-host-web-compat lib/index.js（新增） | 优先 `openPathChooser`，回退旧 `openNativePath`；聊天 mention 与工具行路径点击统一走它 |
 
 JS interface count is checked from source by `scripts/check-bridge-symmetry.mjs`; do not retain the obsolete 0.13.x count after adding bridge methods.
@@ -251,3 +251,7 @@ JS interface count is checked from source by `scripts/check-bridge-symmetry.mjs`
 别名 `virtual-1` 映射到运行时 displayId；viewer Surface 重挂、实时多屏选择与 BrowserHost 视口的
 设备回归仍未收口（见 `known-gaps.md`）。本节记录代码施工状态，不表示已通过设备验证。
 
+
+## 0.14.12-bootfix.1：配置迁移响应
+
+配置导出仍走既有方法；完整活动配置导出成功响应增加 `importable` 与 `hint`。含执行型 YAML 的文件保留为完整备份，`importable: false` 明确表示共享目录文件不可原样通过数据导入入口执行；页面显示该提示。导入成功响应增加实际 `backupPath`，页面使用它而非固定 settings.yaml 文件名。新旧配置选择、先验证再备份以及换树时保留迁移标记由 `HarnessConfigurationMigrationTest` 验证。

@@ -1,33 +1,33 @@
 # RUNTIME-PATCHES.md — assets/patched/ 运行时补丁登记
 
-> 职责：`app/src/main/assets/patched/` 逐文件的权威登记（0.13.7fx-1 起 **2 个在册**，0.14.1 起 **3 个在册**：attachment-local、session-persistence-jsonl、fs-local）——消费方 `EngineManager.applyRuntimePatches()`（EngineManager.kt:636），逐文件目标快照路径/作用/来源线索与维护约定。在册字节数与消费方注册行号 2026-09-25 当场 ls/grep 实测（三条资产随 0.14.2 追上游 0.1.7-rc.1 于 2026-09-24 按 rc.1 快照重建，见 §7.4）；退役批次见 §5。
+> 职责：`app/src/main/assets/patched/` 逐文件的权威登记——消费方 `EngineManager.applyRuntimePatches()`，记录目标快照路径、作用、来源与维护约定。当前三份资产于 2026-11-09 从固定安卓 `v0.14.11` / Harness `0.2.2-rc.1` 快照提取，已与双 ABI 归档逐字节核对；当前字节数见 §2，来源身份与兼容边界见 §7.6。早期重建与退役记录保留为历史，不代表当前引擎基线。
 
 ## 1. 机制（EngineManager.kt）
 
-- **路径速查**：快照解压根 = `filesDir`（usr/ + home/）；dshPkgs = `usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai`（EngineManager.kt:925）；资产源 = APK 内 `assets/patched/`，经 `context.assets.open(asset)` 读取。
-- **触发时机**：每次 `startEngine` 前调用（EngineManager.kt:1030 调用 ⇒ :924 `applyRuntimePatches`）——首启解压后、以及每次快照刷新/重解压后自动重施加（幂等）。
-- **覆盖式全量替换**：`applyAssetPatch`（:938）把 asset 字节整文件写入目标，**非 delta/非行级补丁**——asset 即目标文件的完整修改版拷贝。
-- **内容指纹判定**：目标已存在且字节与 asset 完全一致（contentEquals，:952）才跳过；不用固定 marker 字符串——v1→v2 升级时旧 marker 曾导致更新后的 asset 被误跳过（注释实锤）。快照刷新覆盖目标后指纹失配 → 自动重施加。
+- **路径速查**：快照解压根 = `filesDir`（usr/ + home/）；`applyRuntimePatches()` 中的 dshPkgs = `usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai`；资产源 = APK 内 `assets/patched/`，经 `context.assets.open(asset)` 读取。
+- **触发时机**：`startEngineLocked()` 在实际 spawn 前调用 `applyRuntimePatches()`——首启解压后、以及每次快照刷新/重解压后自动重施加（幂等）。
+- **覆盖式全量替换**：`applyAssetPatch()` 把 asset 字节整文件写入目标，**非 delta/非行级补丁**——asset 即目标文件的完整修改版拷贝。
+- **内容指纹判定**：目标已存在且字节与 asset 完全一致（`contentEquals`）才跳过；不用固定 marker 字符串——v1→v2 升级时旧 marker 曾导致更新后的 asset 被误跳过（注释实锤）。快照刷新覆盖目标后指纹失配 → 自动重施加。
 - **目标包缺席即跳过**：目标父目录不存在时不落补丁（宁缺毋滥不留死覆盖）。
 - ~~hashAdaptive~~（0.13.7fx-1 随 web-frontend-index.html 退役，理由见 §8）：曾用于让 patched 模板跟随引擎 dist 的 content-hash bundle 名；`adaptIndexHashes` 已随 asset 一起删除。
-- 另有 append 式辅助 `applyAssetPatchAppend`（:964，marker 幂等追加，历史上用于 cordis.patch.yml 场景）——当前无调用方，仅保留备用。
+- 另有 append 式辅助 `applyAssetPatchAppend`（marker 幂等追加，历史上用于 cordis.patch.yml 场景）——当前无调用方，仅保留备用。
 
 ## 2. 文件逐项登记
 
-目标根 = 快照内 `usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/`（dshPkgs，EngineManager.kt:925）。asset 字节数与注册行号 2026-09-25 ls/grep 实测。
+目标根 = 快照内 `usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/`（`EngineManager.applyRuntimePatches()` 的 dshPkgs）。以下字节数于 2026-11-09 实测，三个目标包版本均为 `0.2.2-rc.1`；来源归档身份和文件 SHA-256 见 §7.6。
 
-| asset 文件（字节） | 目标快照路径（注册行） | 状态 | 作用 / 来源线索 |
+| asset 文件（字节） | 目标快照路径 | 状态 | 作用 / 同源补丁与边界 |
 |---|---|---|---|
-| attachment-local-index.js（**47,937**，2026-09-24 按 0.1.7-rc.1 快照重建） | dsh-attachment-local/lib/index.js（:926） | 生效 | 0.13.7 重出（引擎 0.1.5-rc.1）+ 0.14.2 随引擎 0.1.7-rc.1 换代重建（§7.4）+ 0.14.0 review C1：**与构建期 `attach-durable-F2` 逐字节同源**（F2 已扩为三件套：祖先 fsync 守卫 + 两处 link(2)→rename 回退 + unlink ENOENT 容忍）；内含图片归一化 2048 降采样上限（`DEFAULT_NORMALIZED_IMAGE_MAX_DIMENSION = 2048`）。补丁判定走内容指纹而非内嵌标记 |
-| session-persistence-jsonl-index.js（**145,247**，2026-09-24 按 0.1.7-rc.1 快照重建） | dsh-session-persistence-jsonl/lib/index.js（:928） | 生效 | 0.13.7 重出 + 0.13.8-b 追加 F5/F7（与构建期同源）+ 0.14.2 随引擎 0.1.7-rc.1 换代重建（§7.4）：两处 link(2) 站点带 EACCES/EPERM/ENOTSUP → rename 回退，发布独占语义由模块级 `dshMobileClaimExclusive/ReleaseClaim` 恢复（O_EXCL 占位 + 失败回收）。**0.14.0 review C1 实锤**：v0.14.0-preview 资产曾是「内联占位 + helper 占位」双占位坏版本（恒 EEXIST 恒 false，旧会话迁移永久失败并留 0 字节毒文件）——修复 = F7 补丁增加 v1→v2 收敛分支 + 本资产从快照重出 + 门禁升级为逐字节比对。行为回归 `scripts/patches/tests/{spj-migration-link-f5,publish-exclusive-reclaim}.test.mjs`（后者支持 `--asset` 直测资产本体） |
-| fs-local-index.js（**47,793**，2026-09-26 由出厂态 fixture 经补丁链重建：F8 + B） | dsh-fs-local/lib/index.js（:930） | 生效 | **0.14.1 重新入册**（apk issue #246）：`writeFileAtomic` 的 `createIfAbsent` 发布站点是全包唯一的 `link(2)` 调用，且该分支失败即抛、无任何回退 → Android 应用域恒拒 hardlink ⇒ 真机上 `write` 工具建不了任何新文件（覆盖已存在文件走 `rename`，正常）。与构建期 `fs-local-link-F8` 逐字节同源。**本资产是 0.13.3 退役资产的重新入册**——当年退役理由「上游 0.1.2-rc.1 已原生覆盖 rename 回退」对 `createIfAbsent` 站点不成立（0.1.5-rc.1 实测：全文仅此一处 `link` 调用，`EACCES`/`EPERM`/`ENOTSUP` 无任何处理）。补丁判定走内容指纹而非内嵌标记。行为回归 `scripts/patches/tests/fs-local-link-f8.test.mjs`（支持 `--asset` 直测资产本体） | **0.14.2 追加 `fs-local-digest-guard-B`**（版本守卫摘要 CAS 兜底）：资产必须同时含 F8+B 两个 marker，否则引擎启动时会把 B 覆盖回「只有 F8」的旧字节 ⇒ 真机上 B 等于没修（实测踩到：旧资产 43,405 B 与当时快照逐字节一致，门禁因快照陈旧而不响）。重建方式 = 取出厂态 fixture 按 registry 顺序施加该文件全部 engine 补丁（产物 47,793 B），**禁止手改**；门禁见 §7.5 |
+| `attachment-local-index.js`（**48,700**） | `dsh-attachment-local/lib/index.js` | 生效 | F2 保留祖先 fsync 守卫、两处 link→rename 回退与 unlink ENOENT 容忍；新增同代资产中的 E1 图片寿命访问记录及 P1 请求预览重新编码。P1 不再直接透传小图原始字节；E1 的历史请求预览继承原图时间，不因被动重放重新续期。模型请求尺寸/字节预算和缺图转文本还依赖对应 `dsh-llm-pi-ai` / `dsh-llm-deepseek` 补丁，不能仅替换本文件宣称整条图像链已升级。当前存储归一化默认总像素预算为 `2048 * 2048`、单边上限为 `8192`，不是旧文档所写的 2048 单边上限。 |
+| `session-persistence-jsonl-index.js`（**149,809**） | `dsh-session-persistence-jsonl/lib/index.js` | 生效 | 与 F5 + F7 同源：迁移发布和 materialize 两处 link 在 EACCES/EPERM/ENOTSUP 时回退，使用 `dshMobileClaimExclusive` / `dshMobileReleaseClaim` 保留 O_EXCL 独占与失败回收，不能退回会覆盖并发创建者的裸 rename。整份来源包含 `0.2.2-rc.1` 的会话持久化实现，不能只把旧资产的 marker 搬过来。行为回归 `spj-migration-link-f5.test.mjs`、`publish-exclusive-reclaim.test.mjs`，后者支持 `--asset` 直接测试资产。 |
+| `fs-local-index.js`（**54,950**） | `dsh-fs-local/lib/index.js` | 生效 | 与 F8 + B 同源：F8 为 `createIfAbsent` 的 hardlink 失败补 O_EXCL 占位 + rename，保留输家 EEXIST 与失败回收；B 在版本 token 因元数据噪声变化时复核已读内容摘要，真实内容变化仍拒绝为 `FS_STALE_VERSION`，不弱化 ctime token。必须同时保留 F8 与 B，防止启动覆盖抹掉构建期修复。行为回归 `fs-local-link-f8.test.mjs --asset`；历史重新入册原因见 §5，marker 全覆盖判据见 §7.5。 |
 
 已退役资产（不在 `assets/patched/`，`applyAssetPatch` 注册行同步移除，勿再引用）：`primitives-index.js`、`fs-local-index.js`（0.13.3 批退役，d377abc——link(2) 回退族改由构建期补丁承担；**0.14.1 已重新入册，见 §2 的 fs-local-index.js 行与 §7.1 的 `fs-local-link-F8`**——退役时该回退并未真正落到构建期补丁，`createIfAbsent` 站点成了覆盖空洞）；`web-frontend-index.html`（0.13.7fx-1 退役，§8）；`llm-deepseek-index.js`（rc.2 起遗留死资产，随重出批删除）。
 
 ## 3. 维护约定（硬约束）
 
 1. **全量替换非 delta**：asset 必须是目标文件的完整拷贝（在原文件基础上改后整体入库）；不允许只存 diff 片段或手写残缺文件——applyAssetPatch 直接 writeBytes 整写，半截文件 = 引擎启动即崩。
-2. **更新需随上游引擎对齐**：三个在册 asset 对应 2026-09-24 按 dsh 0.1.7-rc.1 快照重建的包版本（三条全部与旧资产不同源，见 §7.4）。升级快照内引擎版本时必须：① 逐文件核对上游是否已原生包含同等修复（能删则删，llm-deepseek/rc8 为先例）；② 重出 asset 从对应版本包文件改起，不从旧 asset 迭代；③ 与构建期同源补丁（F2/F5）**两处必须同源**，否则互相回退。
+2. **更新需随上游引擎对齐**：当前三个在册 asset 对应固定 `v0.14.11` 安卓快照中的 `0.2.2-rc.1` 包（§7.6），不再对应历史 `0.1.7` 字节。升级快照内引擎版本时必须：① 逐文件核对上游是否已原生包含同等修复（能删则删，llm-deepseek/rc8 为先例）；② 从新版本已验证快照或对应出厂态文件及完整补丁链重出，不从旧 asset 迭代；③ 对同一目标的**全部**在册 engine 补丁和运行时资产做 marker 与逐字节核对，不能只保留 F2/F5 而漏掉后增补丁。
 3. **禁止随手重生成**：内容指纹机制意味着 asset 与目标「看起来差不多但字节不同」就会触发重写——不得用本地构建产物/不同 minify 形态随手替换 asset；改动须走完整链路验证（引擎起得来、市场/会话/附件功能实测）。
 4. **新增补丁**：applyAssetPatch 注册新条目 + 本表登记；优先评估上游新版本是否已修复（能不补则不补）。
 
@@ -279,6 +279,34 @@ node scripts/patches/apply-patches.mjs <stage> --apply --scope engine --only fs-
 
 **管线自证**：只施加 F8（不带 B）可**逐字节复现**原 43,405 B 资产（sha256 `368e382cc71c…`），
 证明产物确由该 fixture 经补丁链生成，F8+B 版即其正确超集。
+
+### 7.6 0.14.12-bootfix.1：固定 v0.14.11 / Harness 0.2.2 资产对齐（2026-11-09）
+
+本次三个 whole-file JS 资产直接来自 `kelai141/dsh-mobile-apk` 的 `v0.14.11` 发布快照，安卓源提交为
+`f6af65d23c81013d786855637e8758c587fe356b`，Harness 为 `0.2.2-rc.1` / 提交
+`66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db`。双 ABI 下载 URL、压缩归档大小及 SHA-256 的唯一真源是
+`scripts/snapshot-config/verified-runtime.json`，下载入口为 `scripts/fetch-verified-runtime.mjs`。
+这是对固定发布运行时的复用；APK 壳与兼容插件从本仓构建，不表示本轮从 Harness 源码重建了这些归档。
+
+已先验证 arm64 / x86_64 两份归档各自的大小和 SHA-256，再逐文件比较下表资产与归档目标，并读取各目标
+`package.json` 确认为 `0.2.2-rc.1`。两种 ABI 的这三个 JS 文件字节相同；这不意味着归档里的 native
+绑定、Node 二进制或完整运行时可以跨 ABI 使用。
+
+| 资产 | SHA-256（当前完整文件） | registry 同目标补丁 |
+|---|---|---|
+| `attachment-local-index.js` | `a80d44e560b416ad08b05a4e1779542144b2b778a249d46dbe6adf80b9e53287` | `image-expiry-E1`、`image-request-preview-P1`、`attach-durable-F2` |
+| `fs-local-index.js` | `496f4ee0f821ba1f6e7dce00f1ed5063e50135581f52fa04462214e94752d6b5` | `fs-local-link-F8`、`fs-local-digest-guard-B` |
+| `session-persistence-jsonl-index.js` | `c72afc48ca208ddbf5a2441e9fab567e277804e7182dda9fdcfe4c70b64608a8` | `spj-migration-link-F5`、`publish-exclusive-F7` |
+
+§7.1 中 F2/F5/F7/F8 的 Android 发布语义继续适用；历史章节中的旧 fixture 路径与字节数只作事故和
+演进记录。当前回归通过 `tests/lib/fixture.mjs` 的版本选择器读取同代 fixture。新增 E1/P1 作用涉及多个
+引擎包，完整目标与版本前置断言分别见 `image-expiry-E1.mjs`、`image-request-preview-P1.mjs`；资产
+登记只覆盖其中的 attachment-local 目标，不是另建一条独立补丁链。
+
+复核入口：`node scripts/check-runtime-assets.mjs <abi> --snapshot <固定快照路径> --require`。
+本轮记录的 x86_64 严格门禁为三份逐字节一致、全部同目标 marker 在场、F7/F8 资产本体行为测试通过、
+`SKIP=0`；另已独立完成上述双 ABI 字节与包版本核对。设备上的附件上传、会话迁移、文件创建/编辑仍应
+按三层验收要求实测；代码与归档一致不能替代 Android 文件系统和用户操作证据。
 
 ## 8. 0.13.7fx-1：web-frontend-index.html 退役（2026-09-11）
 

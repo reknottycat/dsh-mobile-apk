@@ -3,6 +3,7 @@ package com.dsharnessmobile.shell
 import android.content.Context
 import android.media.MediaScannerConnection
 import android.os.Environment
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
 import java.nio.file.Files
@@ -53,6 +54,10 @@ class EngineManager(private val context: Context, private val pickToken: String?
     private set
 
   val engineReady: Boolean get() = nodeBin.exists()
+
+  /** Generation observed/created by this manager's last start call, including failed spawns. */
+  @Volatile internal var lastStartGeneration: Long = currentGeneration()
+    private set
 
   /**
    * Deploy the undo emergency CLI (assets/undo-emergency.mjs → filesDir).
@@ -195,6 +200,10 @@ class EngineManager(private val context: Context, private val pickToken: String?
       // 事务化本身从不触碰用户数据，这份副本是「万一」时的取证/回滚来源——
       // 只保留最近 3 代，写失败仅告警（不阻断刷新）。
       snapshotSettingsBackup()
+      // DSH 0.2.x imports settings into the active profile once. Never re-seed
+      // legacy YAML over an already-migrated user's profile during a snapshot swap.
+      val userDataNotes = SnapshotUserData.prepareStagedSnapshot(File(stage, "home/.dsh"), File(homeDir, ".dsh"))
+      for (note in userDataNotes) LogCollector.log(TAG, "snapshot user-data policy: " + note)
 
       onStage("正在完成运行时更新…")
       // issue #271 ⑤：**事务自己**清理上一轮的失败残渣（不依赖 30 分钟年龄门槛）。
@@ -557,13 +566,13 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * 写入失败只告警——备份不是刷新的前置条件。
    */
   private fun snapshotSettingsBackup() {
-    val source = File(File(homeDir, ".dsh"), "settings.yaml")
-    if (!SnapshotFs.exists(source)) return
+    val source = SnapshotUserData.configurationDocument(File(homeDir, ".dsh"))
+    if (!source.isFile) return
     try {
       val dir = File(context.filesDir, ".snapshot-settings-backup")
       SnapshotFs.createDirectories(dir)
       val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
-      val target = File(dir, "settings-$stamp.yaml")
+      val target = File(dir, "settings-$stamp-" + source.name)
       source.copyTo(target, overwrite = true)
       // 只保留最近 3 代（按文件名时间戳排序，删旧留新）
       val all = dir.listFiles { f -> f.isFile && f.name.startsWith("settings-") }?.sortedBy { it.name } ?: emptyList()
@@ -1058,7 +1067,19 @@ class EngineManager(private val context: Context, private val pickToken: String?
 
   /** Starts the embedded engine. [force] is reserved for a confirmed hung boot
    * after its full cold-start deadline; routine probes must never force-restart. */
-  fun startEngine(port: Int = 3080, force: Boolean = false): Boolean {
+  fun startEngine(port: Int = 3080, force: Boolean = false, expectedGeneration: Long? = null, recoverPluginTree: Boolean = false): Boolean =
+    synchronized(ENGINE_LIFECYCLE_LOCK) {
+      lastStartGeneration = currentGeneration()
+      if (EngineService.userShutdown) return@synchronized false
+      if (expectedGeneration != null && expectedGeneration != currentGeneration()) {
+        LogCollector.log(TAG, "stale engine recovery ignored: expectedGeneration=$expectedGeneration currentGeneration=${currentGeneration()}")
+        return@synchronized true
+      }
+      startEngineLocked(port, force, recoverPluginTree)
+    }
+
+  private fun startEngineLocked(port: Int, force: Boolean, recoverPluginTree: Boolean): Boolean {
+    val requestGeneration = currentGeneration()
     // 快照刷新进行中禁止拉起（看门狗旁路闸门）：主流程刷新完成后自会启动；期间拉起只会
     // 起在半新半旧的运行时上。返回 true = 「无需再启动」（与冷却窗语义一致，5s 后看门狗复检）。
     if (EngineManager.snapshotRefreshing.get()) {
@@ -1120,16 +1141,23 @@ class EngineManager(private val context: Context, private val pickToken: String?
     lastAvailability = availability
     val engineUsable = availability == EngineProbe.EngineAvailability.OUR_PROCESS ||
       availability == EngineProbe.EngineAvailability.OUR_HTTP
+    // A failure counter belongs to an earlier sample. Re-check HTTP while holding
+    // the lifecycle lock: 401/403 are not permission to terminate a live engine.
+    if ((force || WatchdogV2.degradedHttpTripped()) && EngineProbe.isHttpAlive(httpCode) &&
+      !(recoverPluginTree && WatchdogV2.pluginTreeStillFailed(context))) {
+      WatchdogV2.reset()
+      STARTING.set(false)
+      LogCollector.writeBootDiag(context, "engine-recovery-cancelled",
+        "reason=http-recovered generation=${currentGeneration()} url=${EngineProbe.ENGINE_URL} code=$httpCode")
+      return true
+    }
     if (!force && engineUsable) {
-      // 0.13.8 #175：DEGRADED_HTTP 阶梯触发时，「端口可连」不再是健康证据——半死引擎
-      // 必须允许重启（看门狗/重试路径不带 force 也能走到这里）。这条语义**保持不变**。
-      if (WatchdogV2.degradedHttpTripped()) {
-        LogCollector.log(TAG, "engine start allowed despite reachable port: DEGRADED_HTTP ladder tripped (half-dead engine)")
-      } else {
-        STARTING.set(false)
-        LogCollector.log(TAG, "engine start skipped (existing engine usable: " + availability + ")")
-        return true
-      }
+      // Only the Service's generation-bound, freshly rechecked recovery may
+      // replace a live process. A UI retry must not bypass its grace period by
+      // reading an old DEGRADED_HTTP counter.
+      STARTING.set(false)
+      LogCollector.log(TAG, "engine start skipped (existing engine usable: " + availability + ")")
+      return true
     }
     if (!force && availability == EngineProbe.EngineAvailability.PORT_FOREIGN) {
       // 不再静默：这是「3080 被别的进程占着」——我们要照常启动（下面 killExistingEngine 会清
@@ -1142,7 +1170,20 @@ class EngineManager(private val context: Context, private val pickToken: String?
     }
     return try {
       // 旧进程清理：无论句柄是否还在，先终结残留（引擎挂死/内存里 fork 掉的孤儿）。
-      killExistingEngine()
+      if (force || WatchdogV2.degradedHttpTripped()) {
+        val finalProbe = EngineProbe.check(2_500)
+        LogCollector.writeBootDiag(context, "engine-recovery-final-probe", engineProbeDetail(finalProbe, currentGeneration()))
+        if ((finalProbe.optBoolean("running", false) &&
+            !(recoverPluginTree && WatchdogV2.pluginTreeStillFailed(context))) || EngineService.userShutdown) {
+          WatchdogV2.reset()
+          return true
+        }
+      }
+      if (requestGeneration != currentGeneration() || EngineService.userShutdown) return false
+      killExistingEngine(if (force || WatchdogV2.degradedHttpTripped()) "watchdog-recovery" else "startup-cleanup")
+      if (requestGeneration != currentGeneration() || EngineService.userShutdown) return false
+      lastStartGeneration = ENGINE_GENERATION.incrementAndGet()
+      val spawningGeneration = lastStartGeneration
       // 0.13.1 W5：坏键迁移必须在引擎读 settings 前完成。
       repairSettingsSeed()
       // 0.14.0 #214：退役行 disabled 残留自愈（前置于引擎读 profile；幂等一次性，见函数注释）。
@@ -1160,10 +1201,14 @@ class EngineManager(private val context: Context, private val pickToken: String?
       val args = arrayOf(
         nodeBin.absolutePath, "--expose-internals", dshBin.absolutePath, "web", "--port", port.toString(), "--no-open",
       )
-      engineProcess = startWithArgs(args, shellEnv())
+      val environment = shellEnv()
+      if (spawningGeneration != currentGeneration() || EngineService.userShutdown) return false
+      engineProcess = startWithArgs(args, environment)
       // The cooldown is written only after a real start: failure paths don't consume the window (retry is immediate).
-      EngineManager.lastStartAttemptAt = now
-      LogCollector.log(TAG, "engine started")
+      EngineManager.lastStartAttemptAt = System.currentTimeMillis()
+      lastStartAttemptElapsedMs = SystemClock.elapsedRealtime()
+      LogCollector.writeBootDiag(context, "engine-lifecycle", "action=start generation=${currentGeneration()}")
+      LogCollector.log(TAG, "engine started generation=${currentGeneration()}")
       true
     } catch (t: Throwable) {
       Log.e(TAG, "engine start failed", t)
@@ -1177,19 +1222,19 @@ class EngineManager(private val context: Context, private val pickToken: String?
   }
 
   /**
-   * Absolute path of the Host settings document (`$DSH_HOME/settings.yaml`); empty when missing.
+   * Absolute path of the active configuration (web profile after migration, legacy YAML before it).
    *
    * apk #168：此前取的是**公共导出仓库** `Documents/dshdata/settings.yaml`——那不是配置的落点
    * （配置在私有 `$DSH_HOME`），于是恒返回空串，页面侧接管直接放弃，「打开配置文件」在真机上
    * 一直是坏的。这里换回单一来源。
    */
   fun settingsDocumentPath(): String {
-    val file = File(File(homeDir, ".dsh"), "settings.yaml")
+    val file = SnapshotUserData.configurationDocument(File(homeDir, ".dsh"))
     return if (file.isFile) file.absolutePath else ""
   }
 
   /**
-   * apk #168 第二道坎：把活动 settings.yaml **复制到已放行的公共导出目录**并返回副本路径。
+   * apk #168 第二道坎：把活动配置原子复制到已放行的公共导出目录并返回副本路径。
    *
    * 为什么不直接放行私有路径：`.dsh` 目录里还有 `.credentials.yaml` / deepseek-key.txt 等凭据，
    * 放宽白名单或 FileProvider 映射会把凭据一并交给系统选择器（安全退化）。复制副本只暴露配置
@@ -1197,15 +1242,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * 失败返回空串（调用方保持上游错误路径）。
    */
   fun settingsDocumentExport(): String = try {
-    val src = File(File(homeDir, ".dsh"), "settings.yaml")
-    if (!src.isFile) {
-      ""
-    } else {
-      val dir = File(File(dshDataDir, "exports"), "config").apply { mkdirs() }
-      val dst = File(dir, "settings.yaml")
-      src.copyTo(dst, overwrite = true)
-      dst.absolutePath
-    }
+    SnapshotUserData.exportConfiguration(File(homeDir, ".dsh"), dshDataDir).absolutePath
   } catch (_: Throwable) {
     ""
   }
@@ -1234,7 +1271,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
     // files/boot-segments.log）。这次标记即本世代的起点；监听段由 watchEngineListen() 观察
     // （与启动路径解耦），engine.log 本体壳侧一个字都不写。
     LogCollector.markBootStart(context)
-    watchEngineListen()
+    val generation = currentGeneration()
     fun build(argv: List<String>): ProcessBuilder =
       ProcessBuilder(argv).also { b ->
         b.environment().putAll(env)
@@ -1247,13 +1284,15 @@ class EngineManager(private val context: Context, private val pickToken: String?
         b.redirectErrorStream(true)
         b.redirectOutput(log)
       }
-    return try {
+    val process = try {
       build(args.toList()).start()
     } catch (e: java.io.IOException) {
       if (e.message?.contains("Permission denied") != true) throw e
       Log.w(TAG, "direct exec denied, falling back to linker64: " + e.message)
       build(listOf("/system/bin/linker64") + args.toList()).start()
     }
+    watchEngineListen(process, generation)
+    return process
   }
 
   /**
@@ -1268,12 +1307,12 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * 永远没有 t_listen。单线程、有界 90s（与冷启动预算同量级）后自然退出；每 500ms 一次
    * portReachable(500)（loopback，自带 Proxy.NO_PROXY）。
    */
-  private fun watchEngineListen() {
+  private fun watchEngineListen(process: Process, generation: Long) {
     Thread {
-      val deadline = System.currentTimeMillis() + 90_000L
-      while (System.currentTimeMillis() < deadline) {
+      val deadline = SystemClock.elapsedRealtime() + ENGINE_BOOT_BUDGET_MS + ENGINE_RECOVERY_GRACE_MS
+      while (SystemClock.elapsedRealtime() < deadline && generation == currentGeneration() && process.isAlive) {
         if (EngineProbe.portReachable(500)) {
-          LogCollector.markListen(context)
+          LogCollector.markListen(context, generation)
           return@Thread
         }
         try {
@@ -1657,13 +1696,40 @@ class EngineManager(private val context: Context, private val pickToken: String?
   }
 
   /** Stop the engine process (best-effort). */
-  fun stopEngine() {
-    engineProcess?.destroy()
+  fun stopEngine(reason: String = "manual-shutdown", clearOrphans: Boolean = false, expectedGeneration: Long? = null) = synchronized(ENGINE_LIFECYCLE_LOCK) {
+    if (expectedGeneration != null && currentGeneration() != expectedGeneration) return@synchronized
+    LogCollector.writeBootDiag(context, "engine-lifecycle",
+      "action=stop reason=$reason generation=${currentGeneration()} managedAlive=${engineProcess?.isAlive == true}")
+    ENGINE_GENERATION.incrementAndGet() // Invalidates probes and recovery decisions before touching the process.
+    if (clearOrphans) killExistingEngine(reason) else engineProcess?.destroy()
     engineProcess = null
-    LogCollector.log(TAG, "engine stopped (manual)")
-    // Reset the cooldown after a manual stop: returning to the foreground should allow an immediate restart.
-    EngineManager.lastStartAttemptAt = 0
+    resetCooldown()
+    LogCollector.log(TAG, "engine stopped reason=$reason generation=${currentGeneration()}")
   }
+
+  /** UI callers invalidate work immediately, then perform bounded process cleanup off the main thread. */
+  fun requestStopEngine(reason: String = "manual-shutdown") {
+    val stopGeneration = ENGINE_GENERATION.incrementAndGet()
+    Thread {
+      synchronized(ENGINE_LIFECYCLE_LOCK) {
+        // Reopening the app cancels an old queued close, even if it reuses the
+        // still-live child instead of spawning a new generation.
+        if (EngineService.userShutdown && currentGeneration() == stopGeneration) {
+          stopEngine(reason, expectedGeneration = stopGeneration)
+        }
+      }
+    }.apply { name = "dsh-engine-stop" }.start()
+  }
+
+  /** Serialize the last generation check with all managed starts/stops (also for config rollback). */
+  internal fun withCurrentGeneration(expected: Long, action: () -> Unit): Boolean = synchronized(ENGINE_LIFECYCLE_LOCK) {
+    if (EngineService.userShutdown || expected != currentGeneration()) return@synchronized false
+    action()
+    true
+  }
+
+  internal fun bootAgeMs(): Long = if (lastStartAttemptElapsedMs < 0L) Long.MAX_VALUE else
+    (SystemClock.elapsedRealtime() - lastStartAttemptElapsedMs).coerceAtLeast(0L)
 
   /**
    * 引擎进程存活判定（0.13.0 启动超时 D1 的事实源）：进程句柄活着，或 3080 已可达，
@@ -1692,7 +1758,9 @@ class EngineManager(private val context: Context, private val pickToken: String?
    * 3s 强杀会稳定截断 5s 预算内的优雅排空，编译缓存条目连同每次换树后的热编译一起丢。6s 覆盖
    * 上游预算 + 1s 余量；上限仍是硬界（超时 destroyForcibly，5s→6s 只影响重启路径，不阻塞首启）。
    */
-  private fun killExistingEngine() {
+  private fun killExistingEngine(reason: String) {
+    LogCollector.writeBootDiag(context, "engine-lifecycle",
+      "action=terminate reason=$reason generation=${currentGeneration()} managedAlive=${engineProcess?.isAlive == true}")
     val held = engineProcess
     if (held != null) {
       try {
@@ -1725,6 +1793,7 @@ class EngineManager(private val context: Context, private val pickToken: String?
    *  must be allowed to start the engine immediately. Manual stop already does this. */
   fun resetCooldown() {
     EngineManager.lastStartAttemptAt = 0
+    lastStartAttemptElapsedMs = -1L
   }
 
   /**
@@ -1825,6 +1894,9 @@ class EngineManager(private val context: Context, private val pickToken: String?
       // can't maintain the profiles/node_modules flat fallback); all runtime user data lives in private
       // files/home/.dsh, and public Documents/dshdata is only the export repo.
       "DSH_HOME" to ensurePrivateDshData().absolutePath,
+      // The 0.2.x host-webserver preset reads this env value. Keep the shell's
+      // existing loopback protocol; managed-engine random-port fallback is not enabled.
+      "DSH_ENGINE_PORT" to EngineProbe.ENGINE_PORT.toString(),
       // 0.14.1 块K ③（反馈三）：从 shell 执行 `dsh plugin add` 必失败 —— ERR_PNPM_UNEXPECTED_STORE。
       // 现象：node_modules 链自 `/data/user/0/…/.local/share/pnpm/store/v10`，pnpm 却想用
       // `/data/data/…/.local/share/pnpm/store/v10`；两路径 **inode 相同**（用户实测 719892）
@@ -1924,6 +1996,12 @@ description: 手机操控纪律：无障碍语义树优先、ref 语义点击/�
      *  double-start the engine (device-observed EADDRINUSE). 90s covers the
      *  slowest observed boot with margin. */
     const val START_COOLDOWN_MS = 90_000L
+
+    /** One process lifecycle lock/generation shared by Activity, Service and update requests. */
+    private val ENGINE_LIFECYCLE_LOCK = Any()
+    private val ENGINE_GENERATION = java.util.concurrent.atomic.AtomicLong(0)
+    internal fun currentGeneration(): Long = ENGINE_GENERATION.get()
+    @Volatile private var lastStartAttemptElapsedMs: Long = -1L
 
     /** Process handle shared by every EngineManager in the application process. */
     @Volatile

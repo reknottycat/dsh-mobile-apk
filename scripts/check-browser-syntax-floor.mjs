@@ -33,6 +33,8 @@
 // 用法：
 //   node scripts/check-browser-syntax-floor.mjs --scan <stageRoot|tar.xz>   # 门禁主模式（构建后/发布前）
 //   node scripts/check-browser-syntax-floor.mjs --degrade --stage <dir>     # 构建期降级（原地，chrome87）
+//   node scripts/check-browser-syntax-floor.mjs --degrade --archive <tar.xz> --overlay <empty-dir>
+//                                                                          # 固定快照浏览器覆盖；由 inject-all 单 pass 消费
 //   node scripts/check-browser-syntax-floor.mjs --degrade <file> --out <file>  # 单文件降级（实验/对照）
 //   node scripts/check-browser-syntax-floor.mjs --self-test                 # 自包含四向自证（可离线跑）
 //   node scripts/check-browser-syntax-floor.mjs --self-test --as-shipped <stageRoot|tar.xz>
@@ -49,7 +51,7 @@
 //
 // ⚠️ 双份构建脚本（协调仓 + apk 仓云端副本）必须同改，禁止单边演进（AGENTS.md 雷点 10）。
 import {
-  existsSync, readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync, readdirSync,
+  existsSync, readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync, readdirSync, lstatSync,
 } from 'node:fs'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -255,11 +257,12 @@ if (!has('json')) console.log(notes[notes.length - 1])
 
 // ── 清单口径（两条判据共用，防口径分裂）────────────────────────────────────
 // dist/**/*.js 全部 + 每一个 lib/client.js（含 home/.dsh/profiles/** 镜像副本）。
-const classify = (rel) => {
-  if (/(^|\/)dsh-web-frontend\/dist\/.*\.js$/.test(rel)) return 'frontend-dist'
-  if (/(^|\/)lib\/client\.js$/.test(rel)) return 'client-bundle'
-  return null
-}
+const BROWSER_INVENTORY = [
+  { kind: 'frontend-dist', source: '(^|/)dsh-web-frontend/dist/.*\\.js$' },
+  { kind: 'client-bundle', source: '(^|/)lib/client\\.js$' },
+]
+const inventoryMatchers = BROWSER_INVENTORY.map(({ kind, source }) => ({ kind, pattern: new RegExp(source) }))
+const classify = (rel) => inventoryMatchers.find(({ pattern }) => pattern.test(rel))?.kind ?? null
 const walkDir = (base, rel, out) => {
   let entries
   try { entries = readdirSync(rel ? join(base, rel) : base, { withFileTypes: true }) } catch { return }
@@ -453,6 +456,62 @@ if (has('degrade')) {
   const file = argOf('file') ?? argv[argv.indexOf('--degrade') + 1]
   const stage = argOf('stage')
   const out = argOf('out')
+  const archive = argOf('archive')
+  const overlay = argOf('overlay')
+  if (archive || overlay) {
+    if (!archive || !overlay || stage || out) die('--degrade --archive <tar.xz> --overlay <empty-dir> 必须成对使用，不能同时传 --stage/--out')
+    if (!existsSync(archive)) die('--degrade --archive 输入不存在: ' + archive)
+    if (existsSync(overlay) && (lstatSync(overlay).isSymbolicLink() || !lstatSync(overlay).isDirectory()
+      || readdirSync(overlay).length !== 0)) die('--overlay 必须为不存在或为空的真实暂存目录: ' + overlay)
+    mkdirSync(overlay, { recursive: true })
+    const filesRoot = join(overlay, 'files')
+    try {
+      // The helper receives the exact same inventory as both scan judgments.
+      // It streams the source tar once and never materializes symlinks/hardlinks.
+      const staged = JSON.parse(execFileSync('python', [join(HERE, 'browser-syntax-archive.py'), archive, filesRoot], {
+        input: JSON.stringify(BROWSER_INVENTORY), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+      }))
+      const inventory = [...staged.files, ...staged.links]
+      for (const kind of ['frontend-dist', 'client-bundle']) {
+        if (!inventory.some((row) => row.kind === kind)) throw new Error('archive 浏览器清单缺少 ' + kind + '，拒绝口径漂移')
+      }
+      const files = []
+      let before = 0
+      let after = 0
+      for (const row of staged.files) {
+        const abs = absOf(filesRoot, row.path)
+        const src = readFileSync(abs, 'utf8')
+        const ast = astJudgment(row.path, src)
+        const diff = await diffJudgment(src)
+        if (!ast.bad && !diff.differs) {
+          rmSync(abs)
+          continue
+        }
+        // All production transforms share this one primitive: no format rewrite
+        // and only registry markers already present in the source are retained.
+        const dst = await degradeText(src)
+        if (astJudgment(row.path, dst).bad || (await diffJudgment(dst)).differs)
+          throw new Error('archive 降级后仍不满足原判据: ' + row.path)
+        writeFileSync(abs, dst)
+        before += Buffer.byteLength(src, 'utf8')
+        after += Buffer.byteLength(dst, 'utf8')
+        files.push({ path: row.path, sourceSha256: row.sourceSha256,
+          outputSha256: createHash('sha256').update(dst).digest('hex') })
+      }
+      files.sort((a, b) => a.path.localeCompare(b.path, 'en'))
+      const manifest = { version: 1, target: TARGET_LOW, esbuildVersion: ESBUILD_PIN,
+        archiveSha256: createHash('sha256').update(readFileSync(archive)).digest('hex'), files }
+      writeFileSync(join(overlay, 'browser-overlay.json'), JSON.stringify(manifest, null, 2) + '\n')
+      console.log('BROWSER-SYNTAX-FLOOR DEGRADE archive=' + archive + ' overlay=' + overlay
+        + ' target=' + TARGET_LOW + ' inventory=' + inventory.length + ' changed=' + files.length
+        + ' preserved-links=' + staged.links.length + ' bytes ' + before + ' -> ' + after)
+      console.log('  未改写输入快照；覆盖文件仅供 inject-all 单 pass 消费，最终仍须对完整 tar 执行 --scan。')
+    } catch (error) {
+      rmSync(overlay, { recursive: true, force: true })
+      die('archive 浏览器覆盖生成失败: ' + error.message)
+    }
+    process.exit(0)
+  }
   if (stage) {
     if (!existsSync(stage)) die('--degrade --stage 输入不存在: ' + stage)
     const rels = []
@@ -525,6 +584,27 @@ const checkChainWiring = () => {
       if (degradeLine.n >= consumeLine.n) {
         problems.push(tag + ' 降级(L' + degradeLine.n + ')不在注入消费(L' + consumeLine.n + ')之前'
           + '——注入进快照的就是降级后的字节，顺序反了老内核仍会拿到未降级的 bundle（0.14.2 前这里查的是 combo 预计算顺序）')
+      }
+      // A verified archive is not proof that its browser target matches ours.
+      // Require the archive overlay to be generated from the very input passed
+      // to the injector, and require that same staged overlay to be consumed.
+      const archiveLine = lines.find(({ l }) => l.includes('check-browser-syntax-floor.mjs')
+        && l.includes('--degrade') && l.includes('--archive') && l.includes('--overlay'))
+      const overlayArg = archiveLine && /--overlay['"\s,]+([A-Za-z_$][\w$]*)/.exec(archiveLine.l)?.[1]
+      const archiveArg = archiveLine && /--archive['"\s,]+([A-Za-z_$][\w$]*)/.exec(archiveLine.l)?.[1]
+      const injectionLines = lines.filter(({ n }) => n >= consumeLine.n && n <= consumeLine.n + 10)
+      const overlayUse = injectionLines.find(({ l }) => l.includes('--browser-overlay'))
+      const overlayEscape = overlayArg?.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const archiveEscape = archiveArg?.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const overlayAssign = overlayEscape && lines.find(({ l }) => new RegExp('(?:^|[\\s(])' + overlayEscape + '\\s*=').test(l))
+      const stagedOverlay = overlayAssign && /(?:join|Join-Path).*work.*browser-overlay/.test(overlayAssign.l)
+      const consumedOverlay = overlayUse && /--browser-overlay['"\s,]+([A-Za-z_$][\w$]*)/.exec(overlayUse.l)?.[1]
+      const sameOverlay = overlayArg && consumedOverlay === overlayArg
+      const sameArchive = archiveEscape && new RegExp('(?:^|[\\s,])' + archiveEscape + '(?:[\\s,]|$)').test(consumeLine.l)
+      if (!archiveLine || archiveLine.n >= consumeLine.n || !stagedOverlay || !sameOverlay || !sameArchive) {
+        problems.push(tag + ' 缺少固定快照浏览器 overlay 接线：须以注入同源 archive 生成暂存覆盖，并在同一次 inject-all 消费')
+      } else {
+        evidence.push(tag + ': archive-overlay@L' + archiveLine.n + ' < consume@L' + consumeLine.n + ' overlay=' + overlayArg)
       }
       // ② 暂存副本（**绑定判据**，不是「文件里提到过这个词」）：取降级调用的实际 --stage 实参，
       //    它必须是一个由**暂存路径**赋值的变量。否则就是原地降级 —— `vendor/**/lib/` 是入库跟踪的
@@ -703,12 +783,14 @@ if (has('self-test')) {
       const r = await runScan(mat.root, mat.rels)
       mat.cleanup()
       const rel = p.startsWith(ROOT) ? p.slice(ROOT.length + 1).replace(/\\/g, '/') : p
-      readings.push({ rel, astBad: r.astBad, staticTotal: r.staticTotal, diffHits: r.diffHits, total: r.total })
-      if (r.astBad > 0 && r.diffHits > 0 && redDemonstrated === null) redDemonstrated = readings[readings.length - 1]
+      readings.push({ rel, astBad: r.astBad, diagBad: r.diagBad, staticTotal: r.staticTotal, diffHits: r.diffHits, total: r.total })
+      // Production rejects either independent criterion. A diff-only source is
+      // a real negative control too; requiring both incorrectly calls it green.
+      if ((r.astBad > 0 || r.diagBad > 0 || r.diffHits > 0) && redDemonstrated === null) redDemonstrated = readings[readings.length - 1]
     }
     for (const x of readings) {
       console.log('  真实产物读数: ' + x.rel + ' → AST 违规文件 ' + x.astBad + '（staticBlocks ' + x.staticTotal
-        + '）/ 差分命中 ' + x.diffHits + '/' + x.total)
+        + '，解析诊断文件 ' + x.diagBad + '）/ 差分命中 ' + x.diffHits + '/' + x.total)
     }
     check('⑦ 真实出厂产物反向对照（默认启用，未降级产物必须判红）', redDemonstrated !== null,
       redDemonstrated

@@ -320,10 +320,28 @@ object UndoGate {
    * 1. 急救 CLI 回滚（**优先 `restore <已知良好 id>`**，无可用 id 才退回 `restore-last-good`）
    * 2. 写 .undo-auto-done 标记（幂等 + 供启动页显示）
    * 3. 返回是否执行了回滚（+ 摘要）
+   *
+   * [canRecover] must recheck the original generation, cancellation and liveness.
+   * Listing snapshots can block, so its earlier observation cannot authorize a later write.
    */
-  fun execute(context: Context, engine: EngineManager): UndoResult {
+  fun execute(context: Context, engine: EngineManager, canRecover: () -> Boolean): UndoResult =
+    execute(context, engine, canRecover, null)
+
+  /** The CLI seam lets JVM regressions recover/cancel during list without launching Android node. */
+  internal fun execute(
+    context: Context,
+    engine: EngineManager,
+    canRecover: () -> Boolean,
+    cliRunner: ((List<String>) -> List<String>)?,
+  ): UndoResult {
     if (!autoUndoRunning.compareAndSet(false, true)) return UndoResult(false, "自动回撤已在执行", null)
     try {
+      fun cancellation(stage: String): UndoResult? {
+        if (!Thread.currentThread().isInterrupted && canRecover()) return null
+        record(context, "cancelled stage=" + stage + " reason=recovered-or-generation-changed")
+        return UndoResult(false, "引擎已恢复或启动已变更，取消自动回撤", null)
+      }
+      cancellation("before-list")?.let { return it }
       val dsh = File(engine.homeDir, ".dsh")
       val cli = File(context.filesDir, "undo-emergency.mjs")
       if (!cli.exists()) {
@@ -332,7 +350,7 @@ object UndoGate {
         return UndoResult(false, "急救 CLI 未部署", null)
       }
       // 先确认有快照（空库不执行，避免空转）
-      val list = runCli(context, engine, cli, dsh, listOf("list"))
+      val list = cliRunner?.invoke(listOf("list")) ?: runCli(context, engine, cli, dsh, listOf("list"))
       // #211.1：CLI 超时 = 状态未知，绝不判「无快照可回滚」（旧实现两者同形，超时被静默误判为
       // 空库 → 自动回退从未执行）。此分支只是「不执行」并给出可区分的摘要，不吞掉区别。
       if (list.any { it.contains(ProcIo.TIMEOUT_FLAG) }) {
@@ -345,6 +363,7 @@ object UndoGate {
         record(context, "skipped no-snapshots listLines=" + list.size)
         return UndoResult(false, "无快照可回滚", null)
       }
+      cancellation("after-list")?.let { return it }
       // ── 清单式外科修复（2026-09-21 用户拍板）：**先拔坏插件，不做整份回滚** ──────────────
       // 整份回滚会把「最后一次健康启动之后用户装的插件」全部从装配里抹掉（用户明确否决）。
       // 故顺序是：能点名 → 只拔它；点不出名但清单没变 → 才允许走 known-good 整份回滚；
@@ -353,6 +372,7 @@ object UndoGate {
       val failed = PluginMounts.failedEntryOf(PluginMounts.readEngineLogTail(context))
       val hard = PluginMounts.hardNames(context)
       if (failed != null && failed.name != null && failed.name !in hard) {
+        cancellation("before-pull")?.let { return it }
         if (PluginMounts.pull(context, patch, failed)) {
           record(context, "pulled plugin=" + failed.name + " id=" + (failed.id ?: "?"))
           return UndoResult(true, "已从装配里拔出失败插件（其余插件未改动）：" + failed.name, failed.name)
@@ -382,7 +402,8 @@ object UndoGate {
         record(context, "aborted known-good pruned id=" + known)
         return UndoResult(false, "已知良好快照已被轮转回收（" + known + "）：不自动回滚", null)
       }
-      val out = runCli(context, engine, cli, dsh, listOf("restore", known))
+      cancellation("before-restore")?.let { return it }
+      val out = cliRunner?.invoke(listOf("restore", known)) ?: runCli(context, engine, cli, dsh, listOf("restore", known))
       val ok = out.any { it.contains("完成：还原") }
       val summary = out.joinToString("\n")
       if (ok) {

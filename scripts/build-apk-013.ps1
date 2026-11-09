@@ -232,8 +232,6 @@ New-Item -ItemType Directory -Force -Path $Out | Out-Null
 $pluginManifest = Get-Content (Join-Path $Root "scripts\plugin-dirs.json") -Raw | ConvertFrom-Json
 $pluginDirs = @($pluginManifest.dirs | ForEach-Object { Join-Path $Root $_ })
 $externDirs = @($pluginManifest.externals | ForEach-Object { Join-Path $Root $_ })
-$externByName = @{}
-foreach ($d in $externDirs) { $externByName[(Split-Path $d -Leaf)] = $d }
 
 $rejectedAbis = @()
 $producedAbis = @()
@@ -242,7 +240,9 @@ foreach ($abi in @('arm64', 'x86_64')) {
     # 自检钩子：强制该 ABI 走「拒绝打包」路径（默认空 = 永不触发），用于锁住「任一 ABI 被拒 → 整链非 0」。
     if ($ForceRejectAbi -eq $abi) { Write-Host "自检：强制拒绝 $abi（构建链中止语义自检）"; Deny-Abi $abi "自检钩子"; continue }
     $snap = Join-Path $Root ".deploy-tmp\snapshot-013\$abi\snapshot.tar.xz"
-    if (-not (Test-Path $snap)) { Deny-Abi $abi "缺快照 $snap（先跑 build-snapshot-013.mjs）"; continue }
+    if (-not (Test-Path $snap)) { Deny-Abi $abi "缺快照 $snap（先跑 fetch-verified-runtime.mjs --abi $abi）"; continue }
+    node (Join-Path $Root "scripts\gen-model-catalog.mjs") --snapshot $snap 2>&1
+    if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "固定快照模型目录生成失败"; continue }
     $work = Join-Path $Root ".deploy-tmp\build-\13-$abi"
     New-Item -ItemType Directory -Force -Path $work | Out-Null
 
@@ -254,15 +254,9 @@ foreach ($abi in @('arm64', 'x86_64')) {
     # 1. 插件注入（@dsh-android 专用 + 通用根级包）
     if (-not $SkipInject) {
         New-Item -ItemType Directory -Force -Path (Join-Path $Root ".deploy-tmp\plugins") | Out-Null
-        # undo-savepoint 注入源：vendor/dsh-undo-savepoint（固化移动端裁剪版——
-        # 头部只留快照徽章、移除撤销/恢复快捷键行与全局键盘监听，见其 PATCHES.md 差异表）
-        # 两个根级注入源（undo / marketplace）同样来自 plugin-dirs.json.externals：
-        # marketplace 是固化修复版（上游 0.1.5 pre-execute 守卫不调 next() 导致全工具崩溃，见其
-        # PATCHES.md）；undo 是固化移动端裁剪版。model-sync 已于 0.14.1 摘除（见 profile-web patch 的注释）。
-        $undo = $externByName['dsh-undo-savepoint']
-        $market = $externByName['dshmarketplace-plugin']
-        if (-not (Test-Path (Join-Path $undo "package.json"))) { Deny-Abi $abi "缺 undo 注入源 $undo（git clone lire1131/dsh-undo-savepoint）"; continue }
-        if (-not (Test-Path (Join-Path $market "package.json"))) { Deny-Abi $abi "缺 marketplace 注入源 $market（vendor 固化副本）"; continue }
+        # All root-level vendor packages come from the manifest, including subscriptions.
+        $missingExternals = @($externDirs | Where-Object { -not (Test-Path (Join-Path $_ "package.json")) })
+        if ($missingExternals.Count -gt 0) { Deny-Abi $abi ("缺 vendor 注入源: " + ($missingExternals -join ', ')); continue }
         # 统一补丁门禁（Phase 2a）：marketplace A-D + undo E1-E7 幂等施加与校验，
         # 登记表 scripts/patches/registry.json。默认 ensure 语义（缺席即施加，锚点失配拒打包）。
         # 雷点 8：全量输出——Select-First 截断管道会杀 node 致误判失败
@@ -277,7 +271,7 @@ foreach ($abi in @('arm64', 'x86_64')) {
         # **就地 vs 暂存（这条是硬约束，不是偏好）**：`plugins/*/lib/` 在 .gitignore 内（就地降级对
         # git 不可见，安全）；但 `vendor/*/lib/` 是**入库跟踪**的（.gitignore 有显式 `!vendor/...` 例外）
         # ——就地降级会把它写脏，进而绊停发布链自己的 dirty 门禁（也会让「产物可追溯到已提交源码」失效）。
-        # 故 vendor 三个源先复制到 $work 下再降级，并把**暂存路径**交给 combo 预计算与 inject-all
+        # 故全部 vendor 源先复制到 $work 下再降级，并把**暂存路径**交给 combo 预计算与 inject-all
         # （两处必须用同一份，否则 combo 键与注入内容不一致）。
         # **顺序硬约束**：必须在 combo 预计算之前——T7 实测同一棵树「先算 combo」与「降级后再算」的
         # 键集合仅 49/62 重叠（13 条键随降级改变）；顺序反了这 13 条必然 miss（fail-open 静默回退）。
@@ -289,18 +283,17 @@ foreach ($abi in @('arm64', 'x86_64')) {
         New-Item -ItemType Directory -Force -Path $degradeStaged | Out-Null
         $degradeFailDetail = ""
         # 默认仍指向原源目录（表示「不降级」）；只有真的降级成功才改指向暂存副本。
-        # **必须显式初始化**：无 lib/client.js 的源不会进下面的 if，若这两个变量保持未定义/为 $null，
-        # 后续 `@($undoDeg, ...)` 会含 $null 元素，经 splatting 传给 node 时造成**参数错位**
-        # （实测表现：--out 的值被当成未知参数）。
-        $undoDeg = $undo; $marketDeg = $market
-        # vendor 两源：**暂存副本**再降级（vendor/*/lib 是入库跟踪的，就地降级会写脏仓库并绊停
+        # Every manifest entry contributes one non-null injection path, even without a client bundle.
+        $degradedExternalDirs = @()
+        # 全部 vendor 源：**暂存副本**再降级（vendor/*/lib 是入库跟踪的，就地降级会写脏仓库并绊停
         # 发布链自己的 dirty 门禁）。无 lib/client.js 的源不复制、保持原路径。
         # 本段刻意**不写中间 continue**：构建链静态锁「每个 continue 都必须是经 Deny-Abi 记账的
         # 拒绝路径」（check-build-chain-abort.mjs），而「该源没有浏览器 bundle」是正常跳过不是拒绝；
         # 且嵌套 foreach 里的 continue 只会继续内层循环、不会跳过本 ABI。故失败只记明细，
         # 统一在段末用一条 `Deny-Abi $abi "..."; continue` 记账并跳过本 ABI。
-        foreach ($pair in @(@('undo-degraded', $undo), @('market-degraded', $market))) {
-            $leaf = $pair[0]; $src = $pair[1]
+        foreach ($src in $externDirs) {
+            $leaf = (Split-Path $src -Leaf) + '-degraded'
+            $injectionSource = $src
             if (Test-Path (Join-Path $src "lib\client.js")) {
                 $dst = Join-Path $degradeStaged $leaf
                 Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
@@ -314,9 +307,9 @@ foreach ($abi in @('arm64', 'x86_64')) {
                 }
                 node (Join-Path $Root "scripts\check-browser-syntax-floor.mjs") --degrade --stage $dst 2>&1
                 if ($LASTEXITCODE -ne 0) { $degradeFailDetail = "注入段浏览器语法降级失败（$leaf）" }
-                elseif ($leaf -eq 'undo-degraded') { $undoDeg = $dst }
-                elseif ($leaf -eq 'market-degraded') { $marketDeg = $dst }
+                else { $injectionSource = $dst }
             }
+            $degradedExternalDirs += $injectionSource
         }
         # **不降级我方 plugin**（原实现会 `--degrade --stage <plugin>` 就地改写）：
         #   · 它们已在自己**构建源**里钉了 chrome87（tsdown.client.ts / build-client.mjs），实测
@@ -327,17 +320,23 @@ foreach ($abi in @('arm64', 'x86_64')) {
         # 注入后的权威判据是下方 `check-browser-syntax-floor.mjs --scan <注入后 tar>`——它扫全清单，
         # 一旦有包没降到位就判红；不需要在这里「顺手再降一遍」。
         if (-not [string]::IsNullOrEmpty($degradeFailDetail)) { Deny-Abi $abi $degradeFailDetail; continue }
+        # 固定上游快照的下载哈希不变；其浏览器目标可能高于本 fork 的 WebView 下限。
+        # 只暂存需降级的原成员，和本地插件一起交给下方单次 tar 注入，避免第二次重压缩。
+        $browserOverlay = Join-Path $work "browser-overlay"
+        Remove-Item $browserOverlay -Recurse -Force -ErrorAction SilentlyContinue
+        node (Join-Path $Root "scripts\check-browser-syntax-floor.mjs") --degrade --archive $snap --overlay $browserOverlay 2>&1
+        if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "固定快照浏览器覆盖生成失败"; continue }
         # 单 pass 注入（2c 提速 2026-09-05）：@dsh-android + 根级插件 + 权威 patch 覆盖合并
         # 为一次 tar 流处理——压缩/解压从 ×4 → ×1（原三步各自全量重压缩 ~743MB）。
         # 雷点 8：全量输出。
-        Write-Host "== 单 pass 注入（@dsh-android + undo/market + 权威 patch）（$abi）=="
+        Write-Host "== 单 pass 注入（@dsh-android + 全部 external 插件 + 权威 patch）（$abi）=="
         # ST-05：--all-profiles = 权威 patch 与注入包覆盖全部真实装配 profile（web + headless；
         # 负控 profile headless-bad 由 inject-all.py 显式跳过）。此前只写 web，headless 停在旧值。
-        python (Join-Path $Root "scripts\inject-all.py") $snap (Join-Path $work "snap-final2.tar.xz") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") --dsh-android @pluginDirs --external $undoDeg $marketDeg --all-profiles 2>&1
+        python (Join-Path $Root "scripts\inject-all.py") $snap (Join-Path $work "snap-final2.tar.xz") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") --dsh-android @pluginDirs --external @degradedExternalDirs --browser-overlay $browserOverlay --all-profiles 2>&1
         if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "注入失败"; continue }
         # 防回归（审校 C4 2026-08-23）：patch 挂载集 ⊇ 注入集——缺条目（如 linux-env 漏挂）直接拒打包
         Write-Host "== 挂载集校验（$abi）=="
-        node (Join-Path $Root "scripts\check-patch-mounts.mjs") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") @pluginDirs $undo $market 2>&1 | Select-Object -First 4
+        node (Join-Path $Root "scripts\check-patch-mounts.mjs") (Join-Path $Root "scripts\profile-web.cordis.patch.yml") @pluginDirs @externDirs 2>&1
         if ($LASTEXITCODE -ne 0) { Deny-Abi $abi "patch 挂载集校验失败"; continue }
         # 注入面成员完整性（P0：包内新增文件曾被静默丢弃 → tar 里 import 悬空 → 设备侧引擎启动即死）
         Write-Host "== 注入成员完整性门禁（$abi）=="

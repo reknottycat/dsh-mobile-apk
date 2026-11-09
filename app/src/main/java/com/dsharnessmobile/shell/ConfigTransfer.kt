@@ -10,58 +10,47 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import java.io.File
+import org.json.JSONObject
 
-/** 本文件职责：配置导入导出纯逻辑（settings.yaml 复制/校验）+ 文件选择/SAF 控制器
+/** 本文件职责：活动配置导入导出（legacy settings / profile patch）+ 文件选择/SAF 控制器
  *  （目录 SAF 选择、<input type=file>/图片桥选择——均自 MainActivity 拆出；
  *  ActivityResult 注册时序不变：仍在 Activity 字段初始化阶段完成）。 */
 
 /**
- * 0.13.1 W4：配置导出/导入纯逻辑。
- * 导出：私有 DSH_HOME 的 settings.yaml -> Documents/dshdata/exports/config/settings.yaml。
- * 引擎读的是私有目录（外部改共享副本无效，v0.10.5 布局），本通道提供安全的手改通道：
- * 导出 -> 文件管理器编辑 -> 导入。settings.yaml 不含凭据（API key 在私有 deepseek-key.txt）。
+ * 配置导出/导入：旧版使用 settings.yaml；迁移后使用 profiles/web/cordis.patch.yml。
+ * 导出完整文档（可能包含用户填写的配置值）；含执行型 YAML 的导出明确标记为仅备份，
+ * 共享目录导入不放行执行型标签。私有 .import-backup 始终保留导入前的完整活动文档。
  * 同步执行（JavascriptInterface 专用线程，阻塞 IO 无碍）。
  */
 internal class ConfigTransfer(private val homeDir: File, private val dshDataDir: File) {
 
-  /** 导出私有 settings.yaml 到共享 exports/config/。返回 JSON {ok, path?, error?}。 */
+  /** 导出活动配置到共享 exports/config/。返回 JSON {ok, path?, importable?, hint?, error?}。 */
   fun exportToShared(): String {
     return try {
-      val src = File(homeDir, ".dsh/settings.yaml")
-      if (!src.exists()) return """{"ok":false,"error":"settings.yaml 不存在（引擎尚未初始化？）"}"""
-      val dstDir = File(File(dshDataDir, "exports"), "config")
-      dstDir.mkdirs()
-      val tmp = File(dstDir, ".settings.yaml.tmp")
-      src.copyTo(tmp, overwrite = true)
-      val dst = File(dstDir, "settings.yaml")
-      if (!tmp.renameTo(dst)) throw java.io.IOException("rename failed")
+      val dst = SnapshotUserData.exportConfiguration(File(homeDir, ".dsh"), dshDataDir)
+      val importable = SnapshotUserData.firstExecutableTag(dst.readLines()) == null
       LogCollector.log("dsh-shell", "config exported to " + dst.absolutePath)
-      """{"ok":true,"path":"${dst.absolutePath.replace("\\", "\\\\")}"}"""
+      JSONObject().put("ok", true).put("path", dst.absolutePath).put("importable", importable)
+        .put("hint", if (importable) "已导出当前活动配置，可编辑后导入" else
+          "已导出完整配置备份；文件含执行型 YAML 标签，不能原样从共享目录导入。移除执行型标签后才可导入。")
+        .toString()
     } catch (t: Throwable) {
       Log.w("dsh-shell", "config export failed", t)
-      """{"ok":false,"error":"${(t.message ?: "导出失败").replace("\"", "'")}"}"""
+      JSONObject().put("ok", false).put("error", t.message ?: "导出失败").toString()
     }
   }
 
-  /** 导入共享 exports/config/settings.yaml 到私有 DSH_HOME（引擎 chokidar 热加载）。返回 JSON 同上。 */
+  /** 导入与当前活动配置匹配的共享文档，验证后备份并原子替换。 */
   fun importFromShared(): String {
     return try {
-      val src = File(File(dshDataDir, "exports"), "config/settings.yaml")
-      if (!src.exists()) return """{"ok":false,"error":"未找到 exports/config/settings.yaml（请先导出）"}"""
-      val dst = File(homeDir, ".dsh/settings.yaml")
-      // 导入前留一份私有侧备份（防误导入坏配置后无法回退）。
-      if (dst.exists()) {
-        val bak = File(dst.parentFile, "settings.yaml.import-backup")
-        dst.copyTo(bak, overwrite = true)
-      }
-      val tmp = File(dst.parentFile, ".settings.yaml.import-tmp")
-      src.copyTo(tmp, overwrite = true)
-      if (!tmp.renameTo(dst)) throw java.io.IOException("rename failed")
-      LogCollector.log("dsh-shell", "config imported from " + src.absolutePath)
-      """{"ok":true,"path":"${dst.absolutePath.replace("\\", "\\\\")}","hint":"引擎会热加载；若未生效请开发者选项里重启引擎"}"""
+      val dst = SnapshotUserData.importConfiguration(File(homeDir, ".dsh"), dshDataDir)
+      LogCollector.log("dsh-shell", "config imported to " + dst.absolutePath)
+      JSONObject().put("ok", true).put("path", dst.absolutePath)
+        .put("backupPath", File(dst.parentFile, dst.name + ".import-backup").absolutePath)
+        .put("hint", "引擎会热加载；若未生效请开发者选项里重启引擎").toString()
     } catch (t: Throwable) {
       Log.w("dsh-shell", "config import failed", t)
-      """{"ok":false,"error":"${(t.message ?: "导入失败").replace("\"", "'")}"}"""
+      JSONObject().put("ok", false).put("error", t.message ?: "导入失败").toString()
     }
   }
 }

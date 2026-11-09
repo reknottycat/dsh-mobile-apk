@@ -14,13 +14,19 @@
 
 - **角色**：DeepSeek Harness 安卓壳应用（包名 `com.dsharnessmobile.shell`）。
 - **职责边界**：只保留安卓平台权能与桥——前台服务、看门狗、WebView（主 + 隔离 BrowserHost）、SAF 桥、快照解压与更新、崩溃回退闸门（UndoGate）、Shizuku 特权 transport 与虚拟屏、无障碍/ADB 授权原生写面、通知中心与通知内应答、返回网关、审计、内置控制台、日志。**AI 可见能力全部来自插件**。
-- **运行时形态**：壳内嵌 Termux 运行时快照（`assets/snapshot.tar.xz` → `files/usr` + `files/home`）；引擎（Node.js `@deepseek-ai/dsh`，基线 0.1.7-rc.2）监听 `127.0.0.1:3080`；WebView 加载引擎 Web UI。
+- **运行时形态**：壳内嵌 Termux 运行时快照（`assets/snapshot.tar.xz` → `files/usr` + `files/home`）；引擎（Node.js `@deepseek-ai/dsh`，基线 0.2.2-rc.1）监听 `127.0.0.1:3080`；WebView 加载引擎 Web UI。
 - **构建链**：minSdk 26 / targetSdk 34 / compileSdk 36；Kotlin 2.0.21；AGP 8.8.2；Java 17。
 - **依赖**：androidx.activity-ktx / core-ktx、dynamicanimation、commons-compress、xz；Shizuku `dev.rikka.shizuku:api/provider 13.1.5`（直连 transport）。
-- **兄弟仓库**（协调仓库下的子目录）：`dsh-shell-termux`（0.2.0，Termux 执行器 + 工具链单一表）、`dsh-client-ui-responsive`（0.3.3，移动 UI 注入层 + 来件消费端）、`dsh-host-web-compat`（0.1.13，页面注入/兼容）、`plugins/`（bridge 0.2.4 / manage 0.3.0 / model-capability 0.2.1 / file-open 0.1.0 / browser 0.1.0 / linux-env 0.1.2 / vdisplay 0.1.0，协调仓库内）、`vendor/`（dshmarketplace-plugin、dsh-undo-savepoint 固化副本 + PATCHES.md）。
+- **兄弟仓库**（协调仓库下的子目录）：`dsh-shell-termux`（0.2.0，Termux 执行器 + 工具链单一表）、`dsh-client-ui-responsive`（0.3.3，移动 UI 注入层 + 来件消费端）、`dsh-host-web-compat`（0.1.16，页面注入/兼容）、`plugins/`（bridge 0.2.4 / manage 0.3.0 / model-capability 0.2.1 / file-open 0.1.0 / browser 0.1.0 / linux-env 0.1.2 / vdisplay 0.1.0，协调仓库内）、`vendor/`（dshmarketplace-plugin、dsh-undo-savepoint 固化副本 + PATCHES.md）。
 - **上游** `deepseek-ai/deepseek-harness`（本地 checkout `dsh/`）：只读参考，**零改动**；一切适配以补丁层/插件/壳侧实现。
-- **版本状态**：**0.14.0-preview 已发布（vc38，2026-09-13，9 资产）**：缺陷收口 + 门禁闭环（17 项聚合、SKIP=0）+ 返回手势/通知分级与通知内应答/外部文件草稿；浏览器与虚拟屏为实验特性不接产品路径。**0.13.8 已发布（vc37，2026-09-12，16 资产）**：控制协议 V2 + E6 能力补齐 + P2 收口 + 移动端体验修复。**工作区在 0.14.0-preview 上继续施工 Shizuku 特权 transport / 虚拟屏 viewer / 隔离 BrowserHost / 开放屏幕范围（未提交、未验收）**。详见 apk 仓 `release/`、`AGENTS.md §1` 与协调仓 `docs/0.14.0-preview-*.md`。
+- **版本状态**：当前修复分支为 **0.14.12-bootfix.1（versionCode 71）**，从本仓 0.14.2-fx-2 选择性升级至 Harness 0.2.2-rc.1，并修复启动恢复误判；具体构建与设备验收记录见 `release/v0.14.12-bootfix.1/notes.md`。历史发布记录见 `changelog-archive.md`。
 - **环境无关声明**：本文档适用于任意环境（Windows/WSL/Linux/macOS、有/无真机）开发维护者；环境差异点（WSL、ADB 真机、run-as）已在对应章节标注。
+
+## 当前 fork 构建（2026-11-09）
+
+当前入口 `.github/workflows/build-apk.yml` 在 Java 17 / Node 24 下，从各插件锁文件构建源码，读取 `scripts/contract.json` 的精确官方提交用于门禁，然后通过 `scripts/fetch-verified-runtime.mjs --abi arm64|x86_64` 下载并验证固定安卓运行时。完整性固定在 `scripts/snapshot-config/verified-runtime.json`，同时检查大小与 SHA-256；构建前后的插件注入、权限/鉴权、ELF、运行时资产和 Kotlin 测试门禁仍由 `scripts/build-apk.mjs` 执行。
+
+本轮是**从本仓源码构建 APK 壳与兼容插件，复用固定身份的安卓引擎运行时**。`build-apk-source.yml` 是历史 0.1.7-rc.2 全源码审计链；新契约不匹配时会在开头拒绝，不能用它产出后声称是 0.2.2 的完整源码重建。版本号为 0.14.12-bootfix.1、versionCode 71，签名仍使用仓库既有 keystore。完整发布验收仍要求设备层证据。
 
 ## 2. 构建与验证命令
 
@@ -143,3 +149,7 @@ Harness 先按固定当前提交完成全仓构建，再由 `prepare-harness-ven
 | PowerShell 转义 | 双引号内 `$var` 本地展开（引号地狱）；二进制经 `adb exec-out`/push 传输 | 坑 8 |
 | ABI 匹配 | debug 包默认 x86_64 快照，装 arm64 真机必崩；构建/安装前核对（3.2 步 4） | 坑 18 |
 | 工作树行尾噪声 | `git status` 的 ` M` 与 `check-patch-mirror` 的「仅行尾差异」WARN 常来自 autocrlf（一侧检出为 CRLF），**不是**内容漂移。先逐字节复核（`cmp a b` / `git diff --ignore-cr-at-eol`）再决定要不要动文件，别按噪声改内容 | 铁律 5/6 |
+
+### 固定归档的浏览器兼容转换
+
+采用上游固定 runtime 时，不能假设其中所有 client bundle 已达到本 fork 的语法下限。两条 APK builder 在单次注入前调用 `check-browser-syntax-floor.mjs --degrade --archive <tar> --overlay <临时目录>`，由 `browser-syntax-archive.py` 仅暂存符合原清单的普通浏览器文件；注入器校验归档、来源与输出摘要，并保留本地插件优先级和链接元数据。下载的原始归档保持不变，最终全量语法门禁继续使用原判据。回归：`node --test scripts/browser-overlay.test.mjs`。

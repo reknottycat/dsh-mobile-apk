@@ -46,8 +46,8 @@
 | UndoGate.kt | 连败 6 次急救回退：调 assets/undo-emergency.mjs restore-last-good（幂等/防循环） | EngineService、EngineStartFlow、EngineManager（注释） |
 | SnapshotExtractor.kt | xz tar 流式解压（commons-compress）+ security.android.exec xattr 补章 + zip-slip 防护 | EngineManager、UpdateManager |
 | SnapshotTransaction.kt | 运行时替换事务：暂存解压→原子交换→指纹提交；中断恢复（前滚/回滚/丢弃） | EngineManager |
-| SnapshotFs.kt / SnapshotFileMode.kt / SnapshotUserData.kt | NOFOLLOW 文件原语（目录枚举走 `newDirectoryStream`，避 `Stream.toList()` 的 API 34 依赖）/ 权限位 / ≤0.13.2 遗留 `.dsh-backup` 一次性补写 | SnapshotTransaction、EngineManager |
-| FactoryProfilePatch.kt | 0.14（#214）：profile `cordis.patch.yml` 工厂语义定点纠正（按 id 以工厂为准，退役 disabled 残行清理，用户独有条目不动） | EngineManager、SnapshotTransaction |
+| **SnapshotUserData.kt** | 用户配置保护与历史备份恢复 | `prepareStagedSnapshot` 保留 importer 标记并阻止重新播种已迁移的旧设置；`configurationDocument` 选择真实活动文档；`preservedNames` 保留用户数据，profile 备份恢复不覆盖用户主动缩短的现有配置。 |
+| **FactoryProfilePatch.kt** | 工厂 profile 增量合并与 PTC 格式迁移 | 保留用户值；只有工厂使用新 `launch` 格式时，才把目标 `ptc-runtime` 的直接 `nodeExecutable` 转为 `launch.kind=node-script` 与原 executable；已有 launch、其他插件和未知结构保持原样。 |
 | UpdateManager.kt | 快照在线更新（manifest/sha256/换 usr，usr-old 回退） | EngineManager、EngineStartFlow、UndoGate（注释） |
 | EngineProbe.kt | 引擎探活（Proxy.NO_PROXY 直连 #118；401/303 视作 alive） | 壳侧全部探活唯一入口 |
 | ConsoleActivity.kt | 内置 bash 控制台（assets/console.html + consoleBridge 6 方法） | MainActivity、GuidePageRenderer |

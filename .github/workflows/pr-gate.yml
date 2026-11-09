@@ -7,12 +7,18 @@ on:
   push:
     branches: [main]
 
+env:
+  NPM_CONFIG_CACHE: /tmp/dsh-mobile-npm-cache
+
 jobs:
   static:
     name: 冲突标记与敏感信息扫描
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - name: 冲突标记检查
         if: always()
         run: |
@@ -63,7 +69,7 @@ jobs:
       - name: 协议 V2 往返与体积门禁
         if: always()
         run: |
-          (cd plugins/dsh-android-manage && npm install --no-audit --no-fund && npm run build)
+          (cd plugins/dsh-android-manage && npm ci --no-audit --no-fund && npm run build)
           node scripts/check-protocol-v2.mjs
       - name: 控制 op 登记链门禁
         if: always()
@@ -84,7 +90,7 @@ jobs:
         if: always()
         run: |
           for d in dsh-shell-termux plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-android-browser plugins/dsh-android-vdisplay plugins/dsh-model-capability; do
-            (cd "$d" && npm install --no-audit --no-fund && npm run build)
+            (cd "$d" && npm ci --no-audit --no-fund && npm run build)
           done
           node scripts/check-plugin-tests.mjs
       # 工具返回值 vs output.schema 运行时契约门禁（0.13.8-b 批 B2 T2 / E-10）。
@@ -160,7 +166,7 @@ jobs:
           # dsh-shell-termux 必须在列（linux-env 的 src 直接 import @dsh-android/dsh-shell-termux，
           # 缺它 tsc 报 TS2307）。顺序与云端 build-apk.yml 一致：termux -> 插件。
           for d in dsh-shell-termux plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-android-browser plugins/dsh-android-vdisplay plugins/dsh-model-capability; do
-            (cd "$d" && npm install --no-audit --no-fund && npm run build)
+            (cd "$d" && npm ci --no-audit --no-fund && npm run build)
           done
           node scripts/check-tool-surface-budget.mjs
 
@@ -169,6 +175,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -176,8 +185,12 @@ jobs:
       # Gradle cache acceleration: dependency/build caches reused across runs (full on first, incremental after)
       - uses: gradle/actions/setup-gradle@v4
       - name: 确保 Android SDK platform 36
+        shell: python
         run: |
-          yes | sudo "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+          import os, subprocess
+          sdkmanager = os.path.join(os.environ['ANDROID_HOME'], 'cmdline-tools/latest/bin/sdkmanager')
+          subprocess.run([sdkmanager, 'platforms;android-36', 'build-tools;35.0.0', 'build-tools;36.0.0'],
+                         input='y\n' * 100, text=True, check=True)
       - name: 编译 debug Kotlin（compileDebugKotlin，不依赖快照资产）
         run: |
           chmod +x gradlew

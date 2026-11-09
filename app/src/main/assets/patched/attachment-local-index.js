@@ -3,7 +3,7 @@ import z from "@deepseek-ai/schemastery";
 import { AttachmentError, AttachmentId, AttachmentStore, ImageVariantId, requestImageDimensions } from "@deepseek-ai/dsh-attachment";
 import { dshCachePath, resolveDshHome } from "@deepseek-ai/dsh-home-paths";
 import { createHash, randomUUID } from "node:crypto";
-import { constants, createReadStream } from "node:fs";
+import { constants, createReadStream, statSync, utimesSync } from "node:fs";
 import { chmod, link, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { createLazyRequire } from "@deepseek-ai/dsh-lazy-require";
 //#region lib/types/compression-limiter.js
@@ -422,6 +422,7 @@ async function commitPreparedImageFile(root, prepared) {
 	const sha256 = ensureReference(prepared.ref);
 	if (digest$1(normalized) !== sha256 || normalized.byteLength !== prepared.ref.bytes) throw new AttachmentError("Prepared attachment bytes do not match their reference.", "ATTACHMENT_CORRUPT");
 	await publishImmutableObject(root, normalizedImagePath(root, prepared.ref), normalized, sha256);
+	try { const now = new Date(); utimesSync(normalizedImagePath(root, prepared.ref), now, now); } catch {}
 	return prepared.ref;
 }
 /**
@@ -601,7 +602,7 @@ async function saveImageFile(root, input, limits, policy) {
 /**
 * Read and verify one content-addressed image.
 * @param root - absolute `DSH_HOME/attachments/v1` root.
-* @param ref - reference recorded in the session log.
+* @param ref - supplied image reference; display fields are returned unchanged.
 * @param signal - optional cancellation for filesystem and verification work.
 * @returns verified bytes and reference.
 * @throws the signal reason when aborted, or an AttachmentError when verification fails.
@@ -762,7 +763,7 @@ async function* readFileStreamVerbatim(root, ref, signal) {
 //#region lib/types/request-image.js
 /** Deterministic cached image versions for model requests. */
 /** Transform version included in every cache and upload-index identity. */
-const REQUEST_IMAGE_TRANSFORM_VERSION = "request-image-v6";
+const REQUEST_IMAGE_TRANSFORM_VERSION = "request-image-android-p1"; // dsh-mobile compressed request preview (P1)
 function digest(value) {
 	return createHash("sha256").update(value).digest("hex");
 }
@@ -815,12 +816,7 @@ function sourcePipeline(attachment) {
 	}).toColourspace("srgb");
 }
 async function createRequestImage(attachment, target, hasAlpha) {
-	if (target.width >= attachment.ref.width && target.height >= attachment.ref.height && attachment.data.byteLength <= target.maxBytes) return {
-		data: attachment.data,
-		mediaType: attachment.ref.mediaType,
-		width: attachment.ref.width,
-		height: attachment.ref.height
-	};
+	// dsh-mobile compressed request preview (P1): never forward source bytes, including small screenshots.
 	const encodedVersion = await encodeFirstWithinLimit(encodingLadder(pipeline(attachment, target), hasAlpha), target.maxBytes);
 	return isExhaustedEncoding(encodedVersion) ? encodedVersion.smallest : encodedVersion;
 }
@@ -908,15 +904,19 @@ async function readRequestImageFile(root, attachment, target, signal) {
 //#region lib/types/index.js
 /** Local durable attachment backend rooted below `DSH_HOME`. @module @deepseek-ai/dsh-attachment-local */
 /** Default maximum encoded bytes for one submitted image; oversized sources are refused, not shrunk. */
-const DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const DEFAULT_MAX_IMAGE_BYTES = 50 * 1024 * 1024;
 /** Default maximum images in one prompt. */
 const DEFAULT_MAX_IMAGES_PER_MESSAGE = 20;
 /** Default maximum aggregate image bytes in one prompt. */
 const DEFAULT_MAX_MESSAGE_IMAGE_BYTES = 200 * 1024 * 1024;
 /** Default maximum intrinsic pixels for one submitted image. */
 const DEFAULT_MAX_IMAGE_PIXELS = 64e6;
-/** Default per-side pixel cap for one submitted image. */
-const DEFAULT_MAX_IMAGE_DIMENSION = 8192;
+/**
+* Default per-side pixel cap for one submitted image: the largest side a JPEG
+* can carry. Normalization downscales a long side, so by default the
+* decoded-pixel limit alone bounds admission.
+*/
+const DEFAULT_MAX_IMAGE_DIMENSION = 65535;
 /**
 * Default total-pixel budget of the stored normalized image. A larger source
 * is admitted and downscaled proportionally, so admission bounds what rides
@@ -1011,11 +1011,11 @@ var LocalAttachmentStore = class extends AttachmentStore {
 		this.root = join(dshHome, "attachments", "v1");
 		this.cacheRoot = dshCachePath({ dshHome }, "attachments");
 		this.imageLimits = Object.freeze({
-			maxImageBytes: config.maxImageBytes ?? 20971520,
+			maxImageBytes: config.maxImageBytes ?? 52428800,
 			maxImagesPerMessage: config.maxImagesPerMessage ?? 20,
 			maxMessageImageBytes: config.maxMessageImageBytes ?? 209715200,
 			maxImagePixels: config.maxImagePixels ?? 64e6,
-			maxImageDimension: config.maxImageDimension ?? 8192,
+			maxImageDimension: config.maxImageDimension ?? 65535,
 			mediaTypes: Object.freeze([
 				"image/png",
 				"image/jpeg",
@@ -1047,7 +1047,9 @@ var LocalAttachmentStore = class extends AttachmentStore {
 		const prepared = await this.compression.run(() => prepareImageFile(input, this.imageLimits, this.normalizationPolicy));
 		return commitPreparedImageFile(this.root, prepared);
 	}
+	get imageExpirySupported() { return true; } // dsh-mobile image expiry placeholder (E1)
 	async readImage(ref, signal) {
+		try { const now = new Date(); utimesSync(normalizedImagePath(this.root, ref), now, now); } catch {}
 		return readImageFile(this.root, ref, signal);
 	}
 	imageHostPath(ref) {
@@ -1079,7 +1081,14 @@ var LocalAttachmentStore = class extends AttachmentStore {
 		}
 		if (operation === void 0) {
 			const shared = new SharedRequest((sharedSignal) => this.compression.run(async () => {
-				return await readRequestImageFile(this.cacheRoot, stored ?? await this.readImage(ref, sharedSignal), target, sharedSignal);
+				const version = await readRequestImageFile(this.cacheRoot, stored ?? await readImageFile(this.root, ref, sharedSignal), target, sharedSignal);
+				// A newly encoded preview of an old image must not gain another 120 minutes.
+				try {
+					const accessed = statSync(normalizedImagePath(this.root, ref)).mtime;
+					const hash = String(version.variantId).replace(/^sha256:/, "");
+					utimesSync(join(this.cacheRoot, "request-images", hash.slice(0, 2), hash), accessed, accessed);
+				} catch {}
+				return version;
 			}));
 			operation = shared;
 			this.requestInflight.set(key, shared);

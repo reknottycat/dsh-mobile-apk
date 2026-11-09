@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "repository": "kelai141/dsh-mobile-apk",
+  "tag": "v0.14.11",
+  "commit": "f6af65d23c81013d786855637e8758c587fe356b",
+  "engineVersion": "0.2.2-rc.1",
+  "engineCommit": "66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db",
+  "comment": "Pinned Android runtime inputs. The APK shell and compatible plugins are built from this repository; these archives are upstream release artifacts, not a claim of rebuilding Harness from source.",
+  "artifacts": {
+    "arm64": {
+      "url": "https://github.com/kelai141/dsh-mobile-apk/releases/download/v0.14.11/snapshot-arm64.tar.xz",
+      "size": 162287688,
+      "sha256": "1f41ead47d1854fd3a134964115dc7d0dbeb04365a1d888e102b839fc4d21eb8"
+    },
+    "x86_64": {
+      "url": "https://github.com/kelai141/dsh-mobile-apk/releases/download/v0.14.11/snapshot-x86_64.tar.xz",
+      "size": 158790724,
+      "sha256": "375808b597dc7203623213d1aa459eb22bb1c22b9ab50407298356984e53bafa"
+    }
+  }
+}

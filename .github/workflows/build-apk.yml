@@ -1,140 +1,126 @@
-# build-apk.yml — 云端从源重建 dsh-mobile APK（自包含，宿主=本 APK 仓库）
-#
-# 目标：源码更新后云端能「从源重建快照 + 打包 APK」，不依赖协调库。
-# 整套构建链（build-snapshot/inject/门禁脚本、@dsh-android 插件、插架子仓库、vendor、底座、LICENSES）
-# 均随本仓库提交；本 workflow 只操作本仓库（GITHUB_REPOSITORY = dsh-mobile-apk）。
-#
-# 流程：检出自仓库(node/python/java) -> npm 构建 6 个缺 lib/ 的插件 -> stage 底座 base/
-#       -> node scripts/build-snapshot-013.mjs <abi>（Termux 源装配 + 注入 + 门禁 + 归档）
-#       -> node scripts/build-apk.mjs <abi>（注入插件 + 门禁 + gradle + 产物）
-#       -> upload-artifact（不出 Release）。
-# 注：build-snapshot（Termux 包下载 + 归档压缩）+ 插件 npm 构建较重，需一次 dry-run 迭代验证。
-
+# Build this fork's Kotlin shell and compatible plugins over a pinned Android runtime.
+# Full APK gates and injection remain in scripts/build-apk.mjs.
 name: build-apk
 
 on:
   workflow_dispatch:
     inputs:
       abi:
-        description: '目标 ABI（可多选）'
+        description: 'Target Android ABI'
         type: choice
-        options: [arm64, x86_64, 'both']
-        default: 'both'
+        options: [arm64, x86_64, both]
+        default: arm64
       suffix:
-        description: 'APK 版本后缀（默认空=正式版纯净版本号；测试构建显式传 -fix 等）'
+        description: 'Optional test build suffix'
         type: string
         default: ''
-      source_audit:
-        description: '仅在来源审计 PR 分支上运行固定源码/签名输入构建'
-        type: boolean
-        default: false
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'scripts/**'
+      - 'plugins/**'
+      - 'vendor/**'
+      - 'dsh-*/**'
+      - '.github/workflows/build-apk.yml'
+      - '*.gradle.kts'
+      - 'gradle/**'
+
+permissions:
+  contents: read
 
 jobs:
-  source-audit:
-    if: ${{ inputs.source_audit }}
-    uses: ./.github/workflows/build-apk-source.yml
-
   build:
-    if: ${{ !inputs.source_audit }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
-      # 尊重 workflow_dispatch 的 abi 输入：此前 matrix 写死 [arm64, x86_64]，
-      # 导致 abi=arm64 也照跑 x86_64（纯浪费：双倍分钟、x86_64 产物本机用不上）。
-      # both 时才展开成两条；单选时只跑那一条。
-      matrix:
-        abi: ${{ fromJSON(inputs.abi == 'both' && '["arm64","x86_64"]' || format('["{0}"]', inputs.abi)) }}
       fail-fast: false
+      matrix:
+        abi: ${{ fromJSON(inputs.abi == 'both' && '["arm64","x86_64"]' || format('["{0}"]', inputs.abi || 'arm64')) }}
     env:
-      # build-apk.mjs 依赖本仓库顶层 scripts/plugins/vendor/base；apk 仓库 = $GITHUB_WORKSPACE
       DSH_APK_DIR: ${{ github.workspace }}
+      APK_SUFFIX: ${{ inputs.suffix || '' }}
+      NPM_CONFIG_CACHE: ${{ runner.temp }}/dsh-npm-cache
     steps:
-      - name: 检出本仓库（含 Git LFS 底座归档）
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          lfs: true
-
-      - name: 准备运行时（node；dsh-client-ui-responsive 的 tsdown 要求 node ^22.18 || >=24.11）
-        uses: actions/setup-node@v4
-        with: { node-version: '24' }
-      - name: python -> python3（脚本用 `python`）
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y python3 python-is-python3 || sudo ln -sf /usr/bin/python3 /usr/bin/python
-          python --version
-      - name: 准备 Java（gradle 需要）
-        uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: '17' }
-
-      # 0.14.0 CI/CD 修复 C-3：有锁文件的目录一律走 `npm ci`（按锁文件可复现装配）。
-      # 原实现全用 `npm install`——它**忽略锁文件**、现场重新解析依赖：dsh-client-ui-responsive 的
-      # @deepseek-ai 链路被 ^ 区间放大到 0.1.5-rc.2，与本包精确钉 0.1.5-rc.1 冲突，npm install
-      # 直接 ERESOLVE，云端重建链自 2026-08-28 起从未成功过（本地 CI 同样是这条根因）。
-      # 无锁文件的目录（dsh-host-web-compat 用已提交 lib；dsh-model-capability 无锁）保持 install。
-      - name: 构建插件（有锁文件走 npm ci；dsh-host-web-compat 用已提交 lib）
-        shell: bash
-        run: |
-          set -e
-          install_deps() {
-            if [ -f "$1/package-lock.json" ]; then
-              echo "  deps: npm ci（锁文件在场，可复现）"
-              (cd "$1" && npm ci --no-audit --no-fund)
-            else
-              echo "  deps: npm install（无锁文件，按 package.json 解析）"
-              (cd "$1" && npm install --no-audit --no-fund)
-            fi
-          }
-          # 顺序有意义：dsh-shell-termux 必须**先**构建 —— plugins/dsh-android-linux-env 通过 `file:../../dsh-shell-termux`
-          # 依赖它，编译期解析其 lib/ 类型面；若它尚未构建，tsc 报 TS2307 Cannot find module。
-          for d in dsh-shell-termux dsh-client-ui-responsive plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability plugins/dsh-android-browser plugins/dsh-android-vdisplay; do
-            echo "== npm build $d =="
-            install_deps "$d"
-            (cd "$d" && npm run build)
-          done
-
-      - name: stage 底座归档（base/ -> .deploy-tmp/<base-dir>/）
-        shell: bash
-        run: |
-          set -e
-          abi="${{ matrix.abi }}"
-          # build-snapshot-013.mjs 的 BASE_DIR：arm64 -> arm64-base；x86_64 -> x64-base（缩写，勿写 x86_64-base）
-          if [ "$abi" = "arm64" ]; then bdir="arm64-base"; else bdir="x64-base"; fi
-          mkdir -p ".deploy-tmp/${bdir}"
-          [ -f "base/base-usr-${abi}.tar.xz" ] || { echo "缺 base/base-usr-${abi}.tar.xz"; exit 1; }
-          cp "base/base-usr-${abi}.tar.xz" ".deploy-tmp/${bdir}/base-usr.tar.xz"
-          [ -f "base/base-dsh.tar.xz" ] && cp "base/base-dsh.tar.xz" ".deploy-tmp/${bdir}/base-dsh.tar.xz"
-          du -sh ".deploy-tmp/${bdir}"
-
-      - name: 构建快照 ${abi}（build-snapshot，Termux 源装配 + 注入 + 门禁 + 归档）
-        shell: bash
-        run: |
-          set -e
-          node scripts/build-snapshot-013.mjs "${{ matrix.abi }}"
-
-      # Kotlin 单测（0.14.1 P0）：必须先于 build-apk.mjs 产出 testDebugUnitTest 结果。
-      # build-apk.mjs 无条件调用 check-kotlin-test-count.mjs 且**不传** --allow-missing
-      # （有意为之：结果缺席即判红，防止「类被删/漏编译时 exit 仍 0」的防线删失仍绿），
-      # 而云端链此前不产测试结果 ⇒ 该门禁在 build-apk.yml 上必然判红。
-      # 故本步骤紧接其前、结果目录就位后，才进入打包链。全量取用（同 pr-gate）。
-      - name: Kotlin 单测（:app:testDebugUnitTest 全量，产出结果供数量反回归门禁）
-        shell: bash
-        run: |
-          set -e
-          chmod +x gradlew
-          ./gradlew :app:testDebugUnitTest --no-daemon --console=plain
-
-      - name: 构建 APK ${abi}（注入插件 + 门禁 + gradle + 产物）
-        shell: bash
-        run: |
-          set -e
-          node scripts/build-apk.mjs --abi "${{ matrix.abi }}" --suffix "${{ github.event.inputs.suffix }}"
-
-      - name: 上传 APK 产物（本地下载 debug；不出 Release）
-        uses: actions/upload-artifact@v4
+          lfs: false
+      - uses: actions/setup-node@v4
         with:
-          name: dsh-mobile-apk-${{ matrix.abi }}${{ github.event.inputs.suffix }}
-          # 版本目录来自 app/build.gradle.kts（ST-06）：写死 out/v0.13.0 会在版本 bump 后静默
-          # 落到 if-no-files-found: error（云端链「构建成功但无产物」）。
-          path: out/v*/*.apk
+          node-version: '24'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Android build tools
+        shell: python
+        run: |
+          import os, subprocess
+          sdkmanager = os.path.join(os.environ['ANDROID_HOME'], 'cmdline-tools/latest/bin/sdkmanager')
+          subprocess.run([sdkmanager, 'platforms;android-36', 'build-tools;35.0.0', 'build-tools;36.0.0'],
+                         input='y\n' * 100, text=True, check=True)
+      - name: Build compatible plugins from their lockfiles
+        shell: bash
+        run: |
+          set -euo pipefail
+          for d in dsh-shell-termux dsh-client-ui-responsive plugins/dsh-android-bridge plugins/dsh-android-manage plugins/dsh-android-linux-env plugins/dsh-android-file-open plugins/dsh-model-capability plugins/dsh-android-browser plugins/dsh-android-vdisplay; do
+            (cd "$d" && npm ci --no-audit --no-fund && npm run build)
+          done
+      - name: Verify lifecycle, profile preflight and immutable download regressions
+        run: |
+          (cd dsh-host-web-compat && npm test)
+          node --test vendor/dsh-undo-savepoint/test/bundle-preflight.test.mjs
+          node --test vendor/dsh-plugin-subscriptions/test/codex-custom*.test.mjs
+          node --test scripts/tests/verified-runtime.test.mjs scripts/gen-model-catalog.test.mjs
+          python3 scripts/inject-all.test.py
+          node --test scripts/browser-overlay.test.mjs
+          (cd dsh-client-ui-responsive && npm test)
+      - name: Verify custom Codex credentials through the production Responses adapter
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/tests/codex-protocol-runtime
+          npm run prepare-runtime --prefix scripts/tests/codex-protocol-runtime
+          node scripts/tests/codex-custom-protocol.test.mjs
+      - name: Read exact upstream source for contract gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision=$(node -p "require('./scripts/contract.json').upstream.commit")
+          git init dsh
+          git -C dsh remote add origin https://github.com/deepseek-ai/deepseek-harness.git
+          git -C dsh fetch --depth=1 origin "$revision"
+          git -C dsh checkout --detach FETCH_HEAD
+          tag=$(node -p "require('./scripts/contract.json').upstream.tag")
+          git -C dsh fetch --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+          test "$(git -C dsh rev-parse HEAD)" = "$revision"
+      - name: Verify and download immutable runtime
+        run: node scripts/fetch-verified-runtime.mjs --abi '${{ matrix.abi }}'
+      - name: Run all Kotlin unit tests
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --console=plain --max-workers=4
+      - name: Inject this fork, run APK gates and build
+        run: node scripts/build-apk.mjs --abi '${{ matrix.abi }}' --suffix "$APK_SUFFIX"
+      - name: Verify APK signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          signer="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          expected=$(keytool -list -v -keystore keystore/debug.keystore -storepass android -alias androiddebugkey | sed -n 's/.*SHA256: *//p' | tr -d ':' | tr 'A-F' 'a-f')
+          test -n "$expected"
+          for apk in out/v*/*.apk; do
+            "$signer" verify --verbose --print-certs "$apk" > "$apk.signature.txt"
+            grep -i "$expected" "$apk.signature.txt"
+            sha256sum "$apk" > "$apk.sha256"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-mobile-apk-${{ matrix.abi }}
+          path: |
+            out/v*/*.apk
+            out/v*/*.sha256
+            out/v*/*.signature.txt
+            .deploy-tmp/snapshot-013/*/snapshot.tar.xz.source.json
+            app/build/test-results/testDebugUnitTest/*.xml
           if-no-files-found: error
           retention-days: 30

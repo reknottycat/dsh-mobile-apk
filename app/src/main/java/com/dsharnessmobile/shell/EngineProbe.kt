@@ -37,12 +37,12 @@ import org.json.JSONObject
  * ── 正交分层（本文件最容易被后人改错的一点，务必先读）─────────────────────────
  * **健康位**（`check()` 的 `running`）与**认证态**（`auth`）是两个正交事实，不得互相污染：
  *
- *   · `running` 的判据是 200/401/303 —— 口径**故意保持不变**。它同时被
+ *   · `running` 的判据是 200/401/403/303 —— 口径**故意保持不变**。它同时被
  *     `WatchdogV2.assessProbe` 当作健康位消费，而那条链的下游是 DEGRADED_HTTP 阶梯：
  *     连续 6 拍（30s）会升级为**破坏性**受控重启（强杀活引擎 + 回滚用户配置）。
  *     若把 401 从 `running` 里摘掉，一个只是「需要重新认证」的健康引擎会在 30 秒后被强杀——
  *     正是 decision D3/W2 明令禁止的（`a 401 must never make the watchdog kill a healthy engine`）。
- *   · `auth` 是本轮（M.1 / apk #272）新增的**正交**字段：ok / required / unknown。
+ *   · `auth` 是本轮（M.1 / apk #272）新增的**正交**字段：ok / required / denied / unknown。
  *     需要「401 ⇒ 重新认证」语义的调用方（EngineStartFlow 的启动轮询、MainActivity 的页面自愈）
  *     读 `auth`，而不是要求 `running` 改变。
  *
@@ -61,7 +61,7 @@ object EngineProbe {
   }
 
   /** 401 的语义（M.1）：不是「健康」，是「我们的引擎在，但当前 cookie 不被接受」。 */
-  enum class EngineAuthState { OK, REQUIRED, UNKNOWN }
+  enum class EngineAuthState { OK, REQUIRED, DENIED, UNKNOWN }
 
   /**
    * 纯判据：把「端口/HTTP/托管进程/日志」四个观测合成为一个可辨状态（JVM 单测）。
@@ -88,7 +88,7 @@ object EngineProbe {
   ): EngineAvailability {
     if (managedAlive) return EngineAvailability.OUR_PROCESS
     if (httpCode == 200 || httpCode == 303) return EngineAvailability.OUR_HTTP
-    if (httpCode == 401 && logHasTokenLine) return EngineAvailability.OUR_HTTP
+    if ((httpCode == 401 || httpCode == 403) && logHasTokenLine) return EngineAvailability.OUR_HTTP
     if (portReachable) return EngineAvailability.PORT_FOREIGN
     return EngineAvailability.DOWN
   }
@@ -102,64 +102,75 @@ object EngineProbe {
   internal fun classifyAuthState(httpCode: Int): EngineAuthState = when (httpCode) {
     200, 303 -> EngineAuthState.OK
     401 -> EngineAuthState.REQUIRED
+    403 -> EngineAuthState.DENIED
     else -> EngineAuthState.UNKNOWN
   }
 
 
 
+  /** Authentication/authorization failure proves HTTP liveness, never page readiness. */
+  internal fun isHttpAlive(code: Int): Boolean = code == 200 || code == 303 || code == 401 || code == 403
+
   const val ENGINE_URL = "http://127.0.0.1:3080"
 
   private const val ENGINE_HOST = "127.0.0.1"
-  private const val ENGINE_PORT = 3080
+  internal const val ENGINE_PORT = 3080
 
   /**
    * One-shot reachability probe. Safe on any thread (never the main thread).
    * @param timeoutMs connect+read budget per attempt.
    * @return JSON: {running: Boolean, code: Int, auth: String, listening: Boolean, latencyMs: Int, error?: String}
-   *   running = 200/401/303（引擎 HTTP 层活着；判据口径保持不变，看门狗依赖它）。
-   *   code/auth 把 401（需要重新认证）从「健康」里单独暴露出来（M.1）。
+   *   running = 200/401/403/303（引擎 HTTP 层活着；判据口径保持不变，看门狗依赖它）。
+   *   code/auth 把 401（需要重新认证）与 403（权限拒绝）单独暴露；两者都不是进程死亡。
    *   error distinguishes "timeout" (request swallowed by a proxy / slow
    *   engine) from "refused" (port not open — engine actually down).
    */
-  fun check(timeoutMs: Int = 800): JSONObject {
-    val start = System.currentTimeMillis()
+  fun check(timeoutMs: Int = 800): JSONObject = checkUrl(URL(ENGINE_URL), timeoutMs)
+
+  /** Separate transport seam lets JVM tests exercise real loopback HTTP without reserving port 3080. */
+  internal fun checkUrl(url: URL, timeoutMs: Int): JSONObject {
+    val start = System.nanoTime()
     return try {
       // Proxy.NO_PROXY: bypass the system proxy selector (see class doc, #118).
-      val conn = URL(ENGINE_URL).openConnection(Proxy.NO_PROXY) as HttpURLConnection
+      val conn = url.openConnection(Proxy.NO_PROXY) as HttpURLConnection
       conn.connectTimeout = timeoutMs
       conn.readTimeout = timeoutMs
       conn.requestMethod = "GET"
+      // A readiness request must stay on this loopback URL and expose the original status.
+      conn.instanceFollowRedirects = false
       // 0.13.3 W2: /api is behind browser auth, but GET / is public (only index
       // with ?token= exchanges). Sending the cookie when we have one yields a
       // 200; without it the engine answers 401.
       //
-      // M.1（apk #272）语义修正：**保留** `running` 的原口径（200/401/303 = 引擎活着），
+      // M.1（apk #272）语义修正：**保留** `running` 的原口径（200/401/403/303 = 引擎活着），
       // 另外把「401」单独报出来。为什么不动 `running` 的分母——
       // `WatchdogV2.assessProbe` 是 `if (!running) return if (portReachable) DEGRADED_HTTP else DEAD`，
       // 而 DEGRADED_HTTP 连续 6 拍会升级为**破坏性**受控重启（强杀活引擎 + 回滚用户配置）。
       // 一旦把 401 从 running 里摘掉，一个只是「需要重新认证」的健康引擎就会在 30s 后被强杀——
       // 正是原注释里 decision D3/W2 明令禁止的（「a 401 must never make the watchdog kill a healthy engine」）。
       // 所以新增的是**正交**字段，不是改写 running：
-      //   running   = 200/401/303（引擎 HTTP 层活着；口径不变，看门狗语义不变）
+      //   running   = 200/401/403/303（引擎 HTTP 层活着；口径不变，看门狗语义不变）
       //   code      = 原始响应码（调用方可自行判别）
-      //   auth      = ok / required / unknown（401 ⇒ required ⇒ 触发重新认证 + reload）
+      //   auth      = ok / required / denied / unknown（401 ⇒ required ⇒ 触发重新认证 + reload）
       //   listening = 是否拿到了 HTTP 应答
-      EngineAuth.attach(conn)
       try {
+        EngineAuth.attach(conn)
         val code = conn.responseCode
         val auth = classifyAuthState(code)
-        // running 口径不变（200/401/303）——见上方 D3/W2 说明。
-        val running = code == 200 || code == 401 || code == 303
+        // running 口径不变（200/401/403/303）——见上方 D3/W2 说明。
+        val running = isHttpAlive(code)
         JSONObject()
           .put("running", running)
           .put("code", code)
+          .put("url", URL(url.protocol, url.host, url.port, url.path).toString())
           .put("auth", when (auth) {
             EngineAuthState.OK -> "ok"
             EngineAuthState.REQUIRED -> "required"
+            EngineAuthState.DENIED -> "denied"
             EngineAuthState.UNKNOWN -> "unknown"
           })
           .put("listening", true)
-          .put("latencyMs", System.currentTimeMillis() - start)
+          .put("latencyMs", (System.nanoTime() - start) / 1_000_000L)
       } finally {
         conn.disconnect()
       }
@@ -167,10 +178,12 @@ object EngineProbe {
       val err = when (e) {
         is SocketTimeoutException -> "timeout"
         is ConnectException -> "refused"
-        else -> (e.message ?: "unknown")
+        else -> e.javaClass.simpleName
       }
       JSONObject().put("running", false).put("listening", false)
         .put("auth", "unknown").put("error", err)
+        .put("url", URL(url.protocol, url.host, url.port, url.path).toString()).put("code", -1)
+        .put("latencyMs", (System.nanoTime() - start) / 1_000_000L)
     }
   }
 
@@ -195,4 +208,15 @@ object EngineProbe {
       false
     }
   }
+}
+
+/** A fixed loopback URL and finite error vocabulary keep credentials out of failure diagnostics. */
+internal fun engineProbeDetail(probe: JSONObject, generation: Long): String {
+  val error = when (val value = probe.optString("error", "none")) {
+    "none", "timeout", "refused" -> value
+    else -> "probe-error"
+  }
+  return "generation=$generation url=${EngineProbe.ENGINE_URL} code=${probe.optInt("code", -1)}" +
+    " httpAlive=${probe.optBoolean("running", false)} listening=${probe.optBoolean("listening", false)}" +
+    " latencyMs=${probe.optLong("latencyMs", -1)} error=$error"
 }

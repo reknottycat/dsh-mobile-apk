@@ -12,7 +12,7 @@
  * 输出：plugins/dsh-model-capability/lib/catalog-snapshot.json（随插件注入快照）。
  * 可复现：generatedAt 取 SOURCE_DATE_EPOCH（默认 1704067200），内容相同的两次生成字节一致。
  *
- * 用法：node scripts/gen-model-catalog.mjs [--engine-root <snapshotRoot>] [--out <file>]
+ * 用法：node scripts/gen-model-catalog.mjs [--engine-root <snapshotRoot> | --snapshot <snapshot.tar.xz>] [--out <file>]
  *   默认 engine-root 依次尝试：
  *     .deploy-tmp/snapshot-013/x86_64/stage/root
  *     \\wsl.localhost\<distro>\root\.dsh-stage\x86_64   （0.13.5 W5 之后的 ext4 工作区）
@@ -20,7 +20,9 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
 import { wslHostPath } from './lib/shell.mjs'
+import { modelCapabilities } from './lib/model-catalog.mjs'
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)))
 const argv = process.argv.slice(2)
@@ -40,72 +42,56 @@ const candidates = [
   wslHostPath('/root/.dsh-stage/arm64'),
 ].filter(Boolean)
 
-const engineRoot = candidates.find((p) => existsSync(join(p, PI_SUBPATH, 'dist', 'providers', 'data')))
-if (!engineRoot) {
-  console.error('找不到 pi-ai 厂商目录。候选位置：\n  ' + candidates.join('\n  '))
-  console.error('先跑 build-snapshot-013.mjs，或用 --engine-root 指定快照根（含 usr/lib/...）。')
-  process.exit(1)
+const snapshotInput = argOf('--snapshot', '')
+let piVersion
+let catalogs
+if (snapshotInput) {
+  // Read only the pinned package identity and JSON catalogs. No tar member is extracted
+  // and symlinks are never followed, so the build does not execute snapshot code.
+  const reader = `import json, sys, tarfile
+prefix = sys.argv[2] + '/'
+manifest = None
+catalogs = []
+with tarfile.open(sys.argv[1], 'r|xz') as archive:
+    for member in archive:
+        if not member.isfile():
+            continue
+        if member.name == prefix + 'package.json':
+            manifest = json.load(archive.extractfile(member))
+        elif member.name.startswith(prefix + 'dist/providers/data/') and member.name.endswith('.json'):
+            relative = member.name[len(prefix + 'dist/providers/data/'):]
+            if '/' not in relative:
+                catalogs.append([relative[:-5], json.load(archive.extractfile(member))])
+if not manifest or manifest.get('name') != '@earendil-works/pi-ai' or not catalogs:
+    raise RuntimeError('snapshot is missing the pi-ai package identity or provider catalogs')
+print(json.dumps({'version': manifest['version'], 'catalogs': sorted(catalogs)}))
+`
+  const captured = JSON.parse(execFileSync(process.platform === 'win32' ? 'python' : 'python3',
+    ['-c', reader, resolve(snapshotInput), PI_SUBPATH], { encoding: 'utf8', timeout: 180000, maxBuffer: 64 * 1024 * 1024 }))
+  piVersion = captured.version
+  catalogs = captured.catalogs
+} else {
+  const engineRoot = candidates.find((p) => existsSync(join(p, PI_SUBPATH, 'dist', 'providers', 'data')))
+  if (!engineRoot) {
+    console.error('找不到 pi-ai 厂商目录。候选位置：\n  ' + candidates.join('\n  '))
+    console.error('用 --snapshot 指定已校验快照，或用 --engine-root 指定快照根。')
+    process.exit(1)
+  }
+  const piDir = join(engineRoot, PI_SUBPATH)
+  const dataDir = join(piDir, 'dist', 'providers', 'data')
+  piVersion = JSON.parse(readFileSync(join(piDir, 'package.json'), 'utf8')).version
+  catalogs = readdirSync(dataDir).filter(file => file.endsWith('.json')).sort()
+    .map(file => [file.slice(0, -5), JSON.parse(readFileSync(join(dataDir, file), 'utf8'))])
 }
-
-const piDir = join(engineRoot, PI_SUBPATH)
-const dataDir = join(piDir, 'dist', 'providers', 'data')
-const piVersion = JSON.parse(readFileSync(join(piDir, 'package.json'), 'utf8')).version
 const SOURCE_DATE_EPOCH = Number(process.env.SOURCE_DATE_EPOCH ?? 1704067200)
-
-/** 只保留能力相关字段：cost/description 等与发现无关，去掉可让快照小一个量级。 */
-function compact(entry, providerId) {
-  const out = { provider: typeof entry.provider === 'string' ? entry.provider : providerId }
-  if (typeof entry.api === 'string') out.api = entry.api
-  if (typeof entry.reasoning === 'boolean') out.reasoning = entry.reasoning
-  if (entry.thinkingLevelMap && typeof entry.thinkingLevelMap === 'object') out.thinkingLevelMap = entry.thinkingLevelMap
-  if (Array.isArray(entry.input)) out.input = entry.input.filter((m) => typeof m === 'string')
-  if (typeof entry.contextWindow === 'number') out.contextWindow = entry.contextWindow
-  if (typeof entry.maxTokens === 'number') out.maxTokens = entry.maxTokens
-  const compat = entry.compat
-  if (compat && typeof compat === 'object') {
-    const picked = {}
-    for (const key of ['thinkingFormat', 'supportsReasoningEffort', 'supportsReasoning', 'maxTokensField']) {
-      if (compat[key] !== undefined) picked[key] = compat[key]
-    }
-    if (Object.keys(picked).length > 0) out.compat = picked
-  }
-  return out
-}
-
-const models = {}
-let files = 0
-for (const file of readdirSync(dataDir).filter((f) => f.endsWith('.json')).sort()) {
-  const providerId = file.replace(/\.json$/, '')
-  let catalog
-  try {
-    catalog = JSON.parse(readFileSync(join(dataDir, file), 'utf8'))
-  } catch (error) {
-    console.warn(`跳过 ${file}：${error.message}`)
-    continue
-  }
-  files++
-  for (const [api, group] of Object.entries(catalog)) {
-    if (!group || typeof group !== 'object') continue
-    for (const [id, raw] of Object.entries(group)) {
-      if (!raw || typeof raw !== 'object') continue
-      const entry = compact({ ...raw, api: raw.api ?? api }, providerId)
-      if (!models[id]) models[id] = []
-      // 同 provider 同 api 重复时保留最后一个（后写覆盖，与目录语义一致）
-      const existing = models[id].findIndex((e) => e.provider === entry.provider && e.api === entry.api)
-      if (existing >= 0) models[id][existing] = entry
-      else models[id].push(entry)
-    }
-  }
-}
-
-for (const id of Object.keys(models)) {
-  models[id].sort((a, b) => String(a.provider).localeCompare(String(b.provider)))
-}
+const models = modelCapabilities(catalogs)
+const files = catalogs.length
+if (Object.keys(models).length === 0) throw new Error('pi-ai catalog contains no usable chat model declarations')
 
 const snapshot = {
   schema: 1,
   source: `@earendil-works/pi-ai@${piVersion} dist/providers/data`,
-  engineRootHint: engineRoot,
+  engineRootHint: PI_SUBPATH,
   generatedAt: new Date(SOURCE_DATE_EPOCH * 1000).toISOString(),
   modelCount: Object.keys(models).length,
   models,

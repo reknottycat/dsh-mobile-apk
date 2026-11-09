@@ -17,7 +17,7 @@
 //       scripts/plugin-dirs.json 与 scripts/profile-web.cordis.patch.yml 在场。
 import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { mkdirSync, existsSync, rmSync, copyFileSync, cpSync, writeFileSync, readFileSync, readdirSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 
@@ -53,9 +53,6 @@ if (!existsSync(manifestPath)) { console.error('注入集真源缺失：' + mani
 const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
 const pluginDirs = manifest.dirs.map((d) => join(ROOT, d))
 const externalDirs = manifest.externals.map((d) => join(ROOT, d))
-const externalNamed = (name) => externalDirs.find((p) => p.replace(/\\/g, '/').endsWith('/' + name))
-const undo = externalNamed('dsh-undo-savepoint')
-const market = externalNamed('dshmarketplace-plugin')
 
 // 门禁集（唯一声明处；check-release-gates.mjs 断言与 build-apk-013.ps1 的差集 = 0）
 const GATE_SCRIPTS = [
@@ -159,8 +156,11 @@ try {
   // ---- 1. 前置：基座/插件/vendor 在场 ----
   requires('snapshot 源', snapSrc)
   pluginDirs.forEach((p) => requires('插件', p))
-  requires('vendor undo', join(undo, 'package.json'))
-  requires('vendor market', join(market, 'package.json'))
+  externalDirs.forEach((p) => requires('vendor 注入源', join(p, 'package.json')))
+
+  // The pinned runtime no longer ships model-capability; generate its catalog
+  // from this exact archive before loading plugin/schema gates or injecting it.
+  run('node', [gate('gen-model-catalog.mjs'), '--snapshot', snapSrc])
 
   // ---- 2. 门禁（注入前；与 build-apk-013.ps1 同一份门禁集，0.13.8-b ST-06）----
   log('门禁：补丁镜像一致性…')
@@ -252,7 +252,7 @@ try {
     //     工作树，绊停发布链自身的 dirty 门禁，并让「产物可追溯到已提交源码」失效；
     //   · `plugins/*/lib/` 在 .gitignore 内，但原地降级会改写 lib/ 与包内 node_modules 副本 →
     //     与 apk 仓镜像产生无意义漂移，把 check-patch-mirror 判红（本地链实测踩到）。
-    // 故：需要产物级降级的 vendor 三源先复制到 work 下的**暂存副本**再降级，并把暂存路径交给
+    // 故：需要产物级降级的全部 vendor 源先复制到 work 下的**暂存副本**再降级，并把暂存路径交给
     // combo 预计算与 inject-all（两处必须同一份，否则 combo 键与注入内容不一致）。
     // 我方 3 个带 client bundle 的包已在自己构建源里钉了 chrome87（tsdown.client.ts / build-client.mjs），
     // 不在此处重复降级（重复降级会制造镜像漂移，且无收益）。
@@ -266,33 +266,34 @@ try {
     mkdirSync(degradeStaged, { recursive: true })
     // 默认指向**原源目录**（表示「不降级」）；只有真的降级成功才改指向暂存副本。
     // 无 lib/client.js 的源不复制、保持原路径。
-    const degraded = new Map([
-      ['undo', undo], ['market', market],
-    ])
-    for (const key of ['undo', 'market']) {
-      const src = degraded.get(key)
-      const leaf = key + '-degraded'
+    const degradedExternalDirs = externalDirs.map((src) => {
+      const leaf = basename(src) + '-degraded'
       if (!existsSync(join(src, 'lib', 'client.js'))) {
         log(`  跳过降级（无 lib/client.js）：${src}`)
-        continue
+        return src
       }
       const dst = join(degradeStaged, leaf)
       rmSync(dst, { recursive: true, force: true })
       // cpSync recursive 等价于本地链的 `robocopy /MIR`（整树复制；排除 .git 以免把版本库带进暂存树）
       cpSync(src, dst, { recursive: true, filter: (s) => !s.split(/[\\/]/).includes('.git') })
       run('node', [gate('check-browser-syntax-floor.mjs'), '--degrade', '--stage', dst])
-      degraded.set(key, dst)
       log(`  暂存降级就位：${src} -> ${dst}`)
-    }
-    const undoDeg = degraded.get('undo')
-    const marketDeg = degraded.get('market')
-    log('单 pass 注入（@dsh-android + undo/market + 权威 patch，全部装配 profile）…')
+      return dst
+    })
+    // A fixed upstream snapshot has verified bytes, but may have a newer
+    // browser target than this fork. Stage only its failing browser members;
+    // the same single tar pass below consumes these and the local plugins.
+    const browserOverlay = join(work, 'browser-overlay')
+    rmSync(browserOverlay, { recursive: true, force: true })
+    run('node', [gate('check-browser-syntax-floor.mjs'), '--degrade', '--archive', snapSrc, '--overlay', browserOverlay])
+    log('单 pass 注入（@dsh-android + 全部 external 插件 + 权威 patch，全部装配 profile）…')
     // ST-05：--all-profiles = 权威 patch 写给全部真实装配 profile（web+headless，负控 profile 除外）
     run('python', [
       join(ROOT, 'scripts', 'inject-all.py'), snapSrc, join(work, 'snap-final2.tar.xz'),
       join(ROOT, 'scripts', 'profile-web.cordis.patch.yml'),
       '--dsh-android', ...pluginDirs,
-      '--external', undoDeg, marketDeg,
+      '--external', ...degradedExternalDirs,
+      '--browser-overlay', browserOverlay,
       '--all-profiles',
     ])
     snapIn = join(work, 'snap-final2.tar.xz')
@@ -303,7 +304,7 @@ try {
 
   // ---- 4. 门禁（注入后；与 build-apk-013.ps1 同一份门禁集）----
   log('门禁：patch 挂载集校验（双向差集）…')
-  run('node', [gate('check-patch-mounts.mjs'), join(ROOT, 'scripts', 'profile-web.cordis.patch.yml'), ...pluginDirs, undo, market])
+  run('node', [gate('check-patch-mounts.mjs'), join(ROOT, 'scripts', 'profile-web.cordis.patch.yml'), ...pluginDirs, ...externalDirs])
   // 注入面成员完整性（P0）：包内新增文件必须随注入进 tar，且相对导入不得悬空
   log('门禁：注入成员完整性（成员集合 + 相对导入可解析）…')
   run('node', [gate('check-inject-completeness.mjs'), snapIn])

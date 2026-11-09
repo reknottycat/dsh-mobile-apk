@@ -94,11 +94,11 @@ class EngineProbeTest {
   }
 
   @Test
-  fun `200 and 303 are ok 403 and others are unknown`() {
+  fun `200 and 303 are ok 403 is denied and others are unknown`() {
     assertEquals(EngineProbe.EngineAuthState.OK, EngineProbe.classifyAuthState(200))
     assertEquals(EngineProbe.EngineAuthState.OK, EngineProbe.classifyAuthState(303))
     // 403 是「认证过了但不许访问」，与「需要重新认证」是两件事——不得混为一谈。
-    assertEquals(EngineProbe.EngineAuthState.UNKNOWN, EngineProbe.classifyAuthState(403))
+    assertEquals(EngineProbe.EngineAuthState.DENIED, EngineProbe.classifyAuthState(403))
     assertEquals(EngineProbe.EngineAuthState.UNKNOWN, EngineProbe.classifyAuthState(500))
     assertEquals("没有 HTTP 应答", EngineProbe.EngineAuthState.UNKNOWN, EngineProbe.classifyAuthState(-1))
   }

@@ -93,7 +93,7 @@ class EngineService : Service() {
     setUserShutdown(this, true)
     watchdog?.shutdownNow()
     watchdog = null
-    try { engineManager.stopEngine() } catch (_: Exception) {
+    try { engineManager.requestStopEngine() } catch (_: Exception) {
     }
   }
 
@@ -115,7 +115,9 @@ class EngineService : Service() {
       watchdog = Executors.newSingleThreadScheduledExecutor().also { exec ->
         exec.scheduleWithFixedDelay({
           try {
-            val now = System.currentTimeMillis()
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (userShutdown || Thread.currentThread().isInterrupted) return@scheduleWithFixedDelay
+            val observedGeneration = EngineManager.currentGeneration()
             // P1（0.14.1 通知停摆修复）：通知信道消费的**兜底驱动**（`NotifyStore` 的 drainTick）。
             // 它必须在本拍的任何状态判定之前执行——引擎 HEALTHY 时也要消费，而在 DEAD/DEGRADED 各态下
             // 更是唯一活着的消费者（真机停摆现场：`.notify.ndjson` 一直在长，而事件驱动的消费一条也没
@@ -137,7 +139,7 @@ class EngineService : Service() {
               nextRestartAllowedAt = nextRestartAllowedAt,
               engineReady = engineManager.engineReady,
               engineProcessAlive = engineManager.engineProcessAlive(),
-              bootAgeMs = now - EngineManager.lastStartAttemptAt,
+              bootAgeMs = engineManager.bootAgeMs(),
               restartDeadConfirmations = restartDeadConfirmations,
               // 【issue #274 ①】端口归属的**生产口径**。
               //
@@ -170,6 +172,31 @@ class EngineService : Service() {
               },
             )
             for (line in plan.logs) LogCollector.log("dsh-watchdog", line)
+            if (plan.action == WatchdogV2.TickAction.RESTART || plan.action == WatchdogV2.TickAction.UNDO) {
+              val pluginTreeFailure = state == WatchdogV2.ProbeState.DEGRADED_LOG
+              val confirmed = confirmEngineRecovery(
+                expectedGeneration = observedGeneration,
+                currentGeneration = { EngineManager.currentGeneration() },
+                cancelled = { userShutdown || Thread.currentThread().isInterrupted },
+                stillUnhealthy = {
+                  val freshState = WatchdogV2.assessProbe(this)
+                  LogCollector.writeBootDiag(this, "watchdog-recheck",
+                    WatchdogV2.lastProbeDetail + " state=$freshState action=${plan.action}")
+                  freshState == WatchdogV2.ProbeState.DEAD || freshState == WatchdogV2.ProbeState.DEGRADED_HTTP ||
+                    (pluginTreeFailure && freshState == WatchdogV2.ProbeState.DEGRADED_LOG &&
+                      WatchdogV2.lastLogTail.contains("plugin tree failed to load"))
+                },
+              )
+              if (!confirmed) {
+                if (observedGeneration == EngineManager.currentGeneration()) {
+                  WatchdogV2.reset()
+                  UndoGate.disarm(this)
+                }
+                LogCollector.writeBootDiag(this, "engine-recovery-cancelled",
+                  "reason=recovered-or-generation-changed expectedGeneration=$observedGeneration currentGeneration=${EngineManager.currentGeneration()}")
+                return@scheduleWithFixedDelay
+              }
+            }
             when (plan.action) {
               WatchdogV2.TickAction.IDLE -> {
                 nextRestartAllowedAt = 0L
@@ -179,24 +206,42 @@ class EngineService : Service() {
               WatchdogV2.TickAction.UNDO -> {
                 nextRestartAllowedAt = now + WatchdogV2.nextDelayMs()
                 Thread {
-                  val result = UndoGate.execute(this, engineManager)
-                  if (result.executed) {
-                    // 0.14.1：配置回滚成功后必须解除熔断锁存。tripped 一旦为真即永久 HOLD，
-                    // 只有 HEALTHY 探活或 EngineStartFlow 的唯一一处 reset 能解——而 undo 成功
-                    // 正是「引擎应当重新可用」的时点，此处不复位会让恢复后的世代白白被锁住。
-                    WatchdogV2.reset()
-                    LogCollector.log("dsh-watchdog", "auto-undo ok -> " + (result.snapshotId ?: "?"))
-                    engineManager.resetCooldown()
-                    engineManager.startEngine()
-                  } else {
-                    LogCollector.log("dsh-watchdog", "auto-undo not executed: " + result.summary.take(160))
-                    // 回滚不可用时必须**解除失败计数与熔断锁存**，否则本拍之后再没有恢复路径：
-                    // planTick 在锁存打开后恒 HOLD（不再 RESTART），而「引擎一直死」又永远不会出现
-                    // HEALTHY 拍去解开它 —— 用户看到的是「引擎死了、App 也不再重试」的死局。
-                    // 2026-09-21 设备实测：跨版本护栏拒绝回滚（UndoGate 返回 executed=false）后正是这个形状
-                    // （引擎进程消失、HTTP 000，直到进程重启才恢复）。复位只清计数/锁存，不清 arm 文件；
-                    // 重启仍受退避约束（≤80s），不会打风暴。
-                    WatchdogV2.reset()
+                  fun currentRecovery() = !userShutdown && !Thread.currentThread().isInterrupted &&
+                    observedGeneration == EngineManager.currentGeneration()
+                  engineManager.withCurrentGeneration(observedGeneration) {
+                    LogCollector.writeBootDiag(this, "engine-lifecycle",
+                      "action=rollback reason=watchdog-recovery generation=$observedGeneration " + WatchdogV2.lastProbeDetail)
+                    val result = UndoGate.execute(this, engineManager) {
+                      // CLI list can block while the child recovers or a UI close invalidates
+                      // this generation. Recheck at every write boundary, on this worker only.
+                      if (!currentRecovery()) false else {
+                        val finalState = WatchdogV2.assessProbe(this)
+                        val stillUnhealthy = finalState == WatchdogV2.ProbeState.DEAD ||
+                          finalState == WatchdogV2.ProbeState.DEGRADED_HTTP ||
+                          (finalState == WatchdogV2.ProbeState.DEGRADED_LOG &&
+                            WatchdogV2.pluginTreeStillFailed(this))
+                        currentRecovery() && stillUnhealthy
+                      }
+                    }
+                    if (!currentRecovery()) return@withCurrentGeneration
+                    if (result.executed) {
+                      // 0.14.1：配置回滚成功后必须解除熔断锁存。tripped 一旦为真即永久 HOLD，
+                      // 只有 HEALTHY 探活或 EngineStartFlow 的唯一一处 reset 能解——而 undo 成功
+                      // 正是「引擎应当重新可用」的时点，此处不复位会让恢复后的世代白白被锁住。
+                      WatchdogV2.reset()
+                      LogCollector.log("dsh-watchdog", "auto-undo ok -> " + (result.snapshotId ?: "?"))
+                      engineManager.resetCooldown()
+                      engineManager.startEngine()
+                    } else {
+                      LogCollector.log("dsh-watchdog", "auto-undo not executed: " + result.summary.take(160))
+                      // 回滚不可用时必须**解除失败计数与熔断锁存**，否则本拍之后再没有恢复路径：
+                      // planTick 在锁存打开后恒 HOLD（不再 RESTART），而「引擎一直死」又永远不会出现
+                      // HEALTHY 拍去解开它 —— 用户看到的是「引擎死了、App 也不再重试」的死局。
+                      // 2026-09-21 设备实测：跨版本护栏拒绝回滚（UndoGate 返回 executed=false）后正是这个形状
+                      // （引擎进程消失、HTTP 000，直到进程重启才恢复）。复位只清计数/锁存，不清 arm 文件；
+                      // 重启仍受退避约束（≤80s），不会打风暴。
+                      WatchdogV2.reset()
+                    }
                   }
                 }.start()
               }
@@ -204,14 +249,15 @@ class EngineService : Service() {
                 if (plan.force) {
                   engineManager.mirrorDiagnosticsToShared("engine-boot-hung")
                   LogCollector.log("dsh-watchdog", "tracked child exceeded boot deadline; forcing one controlled restart")
-                } else if (now - lastDeathMirrorAt >= DEATH_MIRROR_INTERVAL_MS) {
+                } else if (lastDeathMirrorAt == 0L || now - lastDeathMirrorAt >= DEATH_MIRROR_INTERVAL_MS) {
                   // review C5：确认死亡的常态重启也镜像现场（10 分钟节流）——后台崩溃循环下
                   // 旧实现只在 force 档镜像，轮转几拍后原始 engine.log 已被滚掉，取证现场丢失。
                   val dir = engineManager.mirrorDiagnosticsToShared("engine-died")
                   if (dir != null) lastDeathMirrorAt = now
                   LogCollector.log("dsh-watchdog", "engine death diagnostics: " + (dir?.absolutePath ?: "unavailable"))
                 }
-                val requested = engineManager.startEngine(force = plan.force)
+                val requested = engineManager.startEngine(force = plan.force, expectedGeneration = observedGeneration,
+                  recoverPluginTree = state == WatchdogV2.ProbeState.DEGRADED_LOG)
                 val delayMs = WatchdogV2.nextDelayMs()
                 nextRestartAllowedAt = now + delayMs
                 LogCollector.log(

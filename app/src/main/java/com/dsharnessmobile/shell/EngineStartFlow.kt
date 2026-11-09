@@ -19,7 +19,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   /** Minimum spacing between retries of a failed engine page (see the monitor below). */
   private val ENGINE_PAGE_RELOAD_INTERVAL_MS = 30_000L
 
-  private val flowRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+  private val flowRunning = EngineStartLease()
   /** Invalidates stale startup work when the user closes or explicitly restarts the engine. */
   private val flowGeneration = java.util.concurrent.atomic.AtomicLong(0)
   private val updateRunning = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -45,17 +45,19 @@ internal class EngineStartFlow(private val activity: MainActivity) {
     override fun run() {
       val monitor = this
       Thread {
+        val observedGeneration = EngineManager.currentGeneration()
         val probe = try { EngineProbe.check(1_500) } catch (_: Exception) { null }
         val httpAlive = probe?.optBoolean("running", false) == true
         val portAlive = EngineProbe.portReachable(500)
         activity.runOnUiThread {
+          if (activity.isDestroyed || observedGeneration != EngineManager.currentGeneration()) return@runOnUiThread
           if (activity.webViewReady && activity.guideViewReady && !activity.userClosedEngine) {
             if (httpAlive || portAlive) {
               engineMonitorFailures = 0
               if (httpAlive) {
                 // C1：本 tick 拿到了真实 HTTP 应答。这条路径覆盖「引擎由看门狗/服务拉起」的世代——
                 // 否则那些世代只有 t_listen（TCP）而没有首个响应读数，C1 在门禁里会被判 SKIP 而非判绿。
-                LogCollector.markFirstHttp(activity)
+                LogCollector.markFirstHttp(activity, observedGeneration)
                 if (activity.guideView.visibility == View.VISIBLE) {
                   activity.showWeb()
                 } else if (activity.enginePageFailed &&
@@ -285,6 +287,8 @@ internal class EngineStartFlow(private val activity: MainActivity) {
 
   /** onDestroy 兜底：停止前台监控与页面冻结看门狗。 */
   fun stopMonitoring() {
+    flowGeneration.incrementAndGet()
+    flowRunning.invalidate()
     engineMonitorHandler.removeCallbacks(engineMonitorRunnable)
     freezeHandler.removeCallbacks(freezeRunnable)
     bootStallHandler.removeCallbacks(bootStallRunnable)
@@ -348,6 +352,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   fun shutdownToGuide() {
     activity.userClosedEngine = true
     flowGeneration.incrementAndGet()
+    flowRunning.invalidate()
     EngineService.setUserShutdown(activity, true)
     engineMonitorHandler.removeCallbacks(engineMonitorRunnable)
     freezeHandler.removeCallbacks(freezeRunnable)
@@ -358,7 +363,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
     }
     try { EngineService.instance?.requestShutdown() } catch (_: Exception) {
     }
-    try { activity.engineManager.stopEngine() } catch (_: Exception) {
+    try { activity.engineManager.requestStopEngine() } catch (_: Exception) {
     }
     try { activity.stopService(Intent(activity, EngineService::class.java)) } catch (_: Exception) {
     }
@@ -366,39 +371,61 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   }
 
   /** 引擎启动超时/失败后进入自动回撤流程：UndoGate 幂等，安全多次调用。 */
-  private fun maybeAutoUndo(generation: Long) {
-    if (activity.userClosedEngine) return
+  private fun maybeAutoUndo(generation: Long, engineGeneration: Long) {
+    if (!isCurrentEngineFlow(generation)) return
     Thread {
       try {
-        // 引擎全死时先决门槛：急救 CLI 存在 + 快照非空 + 幂等窗口。
-        // 0.14.1：阈值必须用 effectiveFailureCount（半死与 DEAD 共用计数），与看门狗侧
-        // EngineService.kt 的 undoReady 同口径。旧实现只读 consecutiveFailures —— 而该计数在
-        // DEGRADED_HTTP（端口可连、HTTP 持续失败）下恒被清零，于是「半死引擎」在这条路径上
-        // 永远达不到阈值，自动回撤静默不可达（与 planTick 的熔断锁存同族盲区）。
-        // DEAD 路径不受影响：DEAD 下 consecutiveDegradedHttp 恒 0，两个计数相等。
-        if (!UndoGate.onProbeFailure(activity, WatchdogV2.effectiveFailureCount())) return@Thread
-        activity.runOnUiThread {
-          activity.applyGuidePhase(GuidePhase.Undoing, "正在执行回撤…", "正在恢复到崩溃前的最后良好快照。")
-        }
-        val result = UndoGate.execute(activity, activity.engineManager)
-        if (result.executed) {
-          // 恢复配置文件后重启引擎（冷却窗复位由 UndoGate 完成后置零）。
-          // 0.14.1：undo 成功即解除熔断锁存（与 EngineService 的 UNDO 分支同口径）——tripped 一旦
-          // 为真即永久 HOLD，若此处不复位，回撤后重启的世代会被上一次的失败计数白白锁住。
-          WatchdogV2.reset()
-          activity.runOnUiThread {
-            if (!isCurrentEngineFlow(generation)) return@runOnUiThread
-            // P3-6：快照 id 不上屏（用户看不懂也做不了什么）——正文说清「回到哪个状态 + 接下来会怎样」，
-            // id 进日志供排查。
-            LogCollector.log("dsh-guide", "undo applied snapshot=" + (result.snapshotId ?: "?"))
-            activity.applyGuidePhase(GuidePhase.Recovering, "回撤完成，正在重启引擎…", "已恢复到上一次可用的运行时状态。")
+        fun currentRecovery() = isCurrentEngineFlow(generation) && !EngineService.userShutdown &&
+          !Thread.currentThread().isInterrupted && engineGeneration == EngineManager.currentGeneration()
+        activity.engineManager.withCurrentGeneration(engineGeneration) {
+          if (!currentRecovery()) return@withCurrentGeneration
+          // This Activity path only handles confirmed process death. A Service may
+          // have recovered the engine meanwhile; it owns hung-live-process recovery.
+          val finalProbe = EngineProbe.check(2_500)
+          if (finalProbe.optBoolean("running", false) || activity.engineManager.engineProcessAlive()) {
+            LogCollector.writeBootDiag(activity, "engine-recovery-cancelled", engineProbeDetail(finalProbe, engineGeneration))
+            return@withCurrentGeneration
           }
-          activity.engineManager.resetCooldown()
-          if (isCurrentEngineFlow(generation)) activity.engineManager.startEngine()
-        } else {
+          // 引擎全死时先决门槛：急救 CLI 存在 + 快照非空 + 幂等窗口。
+          // 0.14.1：阈值必须用 effectiveFailureCount（半死与 DEAD 共用计数），与看门狗侧
+          // EngineService.kt 的 undoReady 同口径。旧实现只读 consecutiveFailures —— 而该计数在
+          // DEGRADED_HTTP（端口可连、HTTP 持续失败）下恒被清零，于是「半死引擎」在这条路径上
+          // 永远达不到阈值，自动回撤静默不可达（与 planTick 的熔断锁存同族盲区）。
+          // DEAD 路径不受影响：DEAD 下 consecutiveDegradedHttp 恒 0，两个计数相等。
+          if (!UndoGate.onProbeFailure(activity, WatchdogV2.effectiveFailureCount())) return@withCurrentGeneration
           activity.runOnUiThread {
-            if (!isCurrentEngineFlow(generation)) return@runOnUiThread
-            activity.applyGuidePhase(GuidePhase.Error, "自动回撤不可用", undoUnavailableHint(result.summary))
+            if (!currentRecovery()) return@runOnUiThread
+            activity.applyGuidePhase(GuidePhase.Undoing, "正在执行回撤…", "正在恢复到崩溃前的最后良好快照。")
+          }
+          val result = UndoGate.execute(activity, activity.engineManager) {
+            // A list subprocess can outlive the observation that started rollback.
+            // This Activity path only permits recovery while the process remains dead.
+            if (!currentRecovery()) false else {
+              val probe = EngineProbe.check(2_500)
+              val stillDead = !probe.optBoolean("running", false) && !activity.engineManager.engineProcessAlive()
+              currentRecovery() && stillDead
+            }
+          }
+          if (!currentRecovery()) return@withCurrentGeneration
+          if (result.executed) {
+            // 恢复配置文件后重启引擎（冷却窗复位由 UndoGate 完成后置零）。
+            // 0.14.1：undo 成功即解除熔断锁存（与 EngineService 的 UNDO 分支同口径）——tripped 一旦
+            // 为真即永久 HOLD，若此处不复位，回撤后重启的世代会被上一次的失败计数白白锁住。
+            WatchdogV2.reset()
+            activity.runOnUiThread {
+              if (!isCurrentEngineFlow(generation)) return@runOnUiThread
+              // P3-6：快照 id 不上屏（用户看不懂也做不了什么）——正文说清「回到哪个状态 + 接下来会怎样」，
+              // id 进日志供排查。
+              LogCollector.log("dsh-guide", "undo applied snapshot=" + (result.snapshotId ?: "?"))
+              activity.applyGuidePhase(GuidePhase.Recovering, "回撤完成，正在重启引擎…", "已恢复到上一次可用的运行时状态。")
+            }
+            activity.engineManager.resetCooldown()
+            if (isCurrentEngineFlow(generation)) activity.engineManager.startEngine()
+          } else {
+            activity.runOnUiThread {
+              if (!isCurrentEngineFlow(generation)) return@runOnUiThread
+              activity.applyGuidePhase(GuidePhase.Error, "自动回撤不可用", undoUnavailableHint(result.summary))
+            }
           }
         }
       } catch (t: Throwable) {
@@ -408,10 +435,10 @@ internal class EngineStartFlow(private val activity: MainActivity) {
   }
 
   /** 引擎启动超时（startEngineFlow 轮询失败后调用）：触发自动回撤。 */
-  private fun onEngineStartTimeout(generation: Long) {
+  private fun onEngineStartTimeout(generation: Long, engineGeneration: Long) {
     // 先给看门狗一次机会：WatchdogV2 熔断阈值(12)远高于此处的保守阈值(6)，
     // 因此本路径只在「启动即失败」时触发；正常慢启动不会到达这里。
-    maybeAutoUndo(generation)
+    maybeAutoUndo(generation, engineGeneration)
   }
 
   private fun scheduleEngineRetry(generation: Long) {
@@ -439,7 +466,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
     // onCreate and the following onResume can both request startup. Acquire the
     // flow before mutating lifecycle state so a duplicate cannot invalidate the
     // actual starter.
-    if (!flowRunning.compareAndSet(false, true)) return
+    val flowOwner = flowRunning.acquire() ?: return
     val generation = flowGeneration.incrementAndGet()
     // 新启动世代 = boot-stall 的新 epoch：在此复位（**不在** onPageFinished。
     // onPageFinished 只代表文档加载完，在那里复位会造成同 epoch 重复报，见 L-1）。
@@ -454,6 +481,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       // FX-210.1（源文档 §3.3 B1 顺序约束）：恢复入口是「服务路径与 Activity 路径」的
       // 共同前置——引擎已被前台服务拉起时重开 app 也要消费 .snapshot-transaction 判据，
       // 因此它必须排在「引擎已在跑」早退之前（顺序由 startupRecoverThenProbe 保证）。
+      var existingProbeGeneration = EngineManager.currentGeneration()
       val engineAlreadyRunning = startupRecoverThenProbe(
         recover = {
           activity.engineManager.recoverInterruptedRefresh()
@@ -466,15 +494,19 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         // M.1（#272）：这里问的是「**我们自己的**引擎是否已在跑」，而不是「HTTP 是否完全就绪」。
         // `running` 口径未变（含 401）⇒ 401 也算「已在跑」（引擎在、只是要重新认证），
         // 否则每次冷启动都会被判为「引擎没起」而重复拉起（decision D3/W2 必须保持）。
-        probeRunning = { EngineProbe.check().optBoolean("running", false) },
+        probeRunning = {
+          existingProbeGeneration = EngineManager.currentGeneration()
+          val result = EngineProbe.check()
+          existingProbeGeneration == EngineManager.currentGeneration() && result.optBoolean("running", false)
+        },
       )
       if (engineAlreadyRunning) {
         // P-AC-04：这条早退路径不经过 spawn 观察线程，补一次 listen 标记（幂等；本进程没记过
         // t_boot_start 时按「未知」记 -1 落盘，而不是让三字段整行缺失）。
-        LogCollector.markListen(activity)
+        LogCollector.markListen(activity, existingProbeGeneration)
         // C1：探活已经拿到 HTTP 应答（engineAlreadyRunning 覆盖 running 或 401=可认证，见 probeRunning）；
         // 所以首个响应时刻同样可判——否则「进程内接手已在跑的引擎」这一路径永远没有 C1 读数。
-        LogCollector.markFirstHttp(activity)
+        LogCollector.markFirstHttp(activity, existingProbeGeneration)
         activity.runOnUiThread { if (isCurrentEngineFlow(generation)) activity.showWeb() }
         return@Thread
       }
@@ -594,7 +626,10 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       if (!isCurrentEngineFlow(generation)) return@Thread
       // 急救 CLI 随 App 版本部署（内容比对幂等）：下探失败时自动回撤的前置依赖。
       activity.engineManager.deployUndoCli()
-      if (!activity.engineManager.startEngine()) {
+      val startAccepted = activity.engineManager.startEngine()
+      val engineGeneration = activity.engineManager.lastStartGeneration
+      if (!isCurrentEngineFlow(generation) || engineGeneration != EngineManager.currentGeneration()) return@Thread
+      if (!startAccepted) {
         // 任务 19：失败终态落盘（此前这条路径**零落盘**——用户反馈第一条的真因）。
         //
         // issue #271 ④：区分「被前置条件拒绝」与「spawn 真失败」。半搬态（live 树缺 node）
@@ -611,7 +646,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           activity.applyGuidePhase(GuidePhase.Error, "引擎启动失败")
           activity.showGuide()
         }
-        maybeAutoUndo(generation)
+        maybeAutoUndo(generation, engineGeneration)
         // #118 建议7：失败不清零计数时自动重试（Error 页不再需要手动点重试）。
         scheduleEngineRetry(generation)
         return@Thread
@@ -625,50 +660,60 @@ internal class EngineStartFlow(private val activity: MainActivity) {
       // 90s 却把文案硬编码成 60 - s，首帧即显示「已等待 -30s」；本处不再出现任何字面量秒数。
       val pollBudgetMs = ENGINE_BOOT_BUDGET_MS
       val pollStepMs = ENGINE_BOOT_POLL_STEP_MS
-      val budgetEnd = System.currentTimeMillis() + pollBudgetMs
+      val pollStartedAt = SystemClock.elapsedRealtime()
+      var lastProbe = org.json.JSONObject()
       var booted = false
-      while (System.currentTimeMillis() < budgetEnd) {
-        if (!isCurrentEngineFlow(generation)) return@Thread
-        // M.1（#272）缺陷 b：先看 401 —— 它意味着「引擎在，但当前 cookie 不被接受」，
-        // 必须触发重新认证，**不能**当成「已就绪」放行（旧实现正是这样把用户留在 401 页面且无出口），
-        // 也**不能**当成「引擎死亡」（`running` 仍含 401 ⇒ engineProcessAlive 路径不变，D3/W2 不受影响）。
-        val probe = EngineProbe.check()
-        if (probe.optString("auth") == "required") {
-          LogCollector.log("dsh-engine-start", "engine answered 401 during boot: re-authenticating (cookie rejected)")
+      var authRefreshAttempted = false
+      fun currentAttempt(): Boolean = isCurrentEngineFlow(generation) &&
+        EngineManager.currentGeneration() == engineGeneration
+      fun observeHttp(): Boolean {
+        lastProbe = EngineProbe.check(1_500)
+        if (!currentAttempt()) return false
+        // 401/403 are actual HTTP responses. Record them before the auth branch;
+        // lack of a browser cookie must never erase a proven listening timestamp.
+        if (lastProbe.optBoolean("listening", false)) {
+          LogCollector.markListen(activity, engineGeneration)
+          LogCollector.markFirstHttp(activity, engineGeneration)
+        }
+        if (lastProbe.optString("auth") == "required" && !authRefreshAttempted) {
+          authRefreshAttempted = true
           runCatching { EngineAuth.handleUnauthorized(activity) }
-          // 认证刷新后本拍不算就绪：继续轮询，下一拍 200 才是真的就绪。
-          Thread.sleep(pollStepMs)
-          continue
         }
-        if (probe.optBoolean("running", false)) {
-          booted = true
-          // P-AC-04：主路径的 listen 标记（watchEngineListen 线程为主，这里兜底；幂等）。
-          LogCollector.markListen(activity)
-          // C1（0.14.1 块F）：**首个 HTTP 响应**。上面这次 EngineProbe.check() 真正拿到了 HTTP 应答
-          // （running=true 只在 200/401/303 时成立，见 EngineProbe.check 的判据），这正是 C1 要的读数。
-          // M.1（#272）新增的是正交的 auth 字段，running 口径未动。
-          // 要的「首个 HTTP 响应」而不是 TCP LISTEN。与 t_listen 分开记，使「LISTEN 快、首个响应慢」
-          // 这条已验证的假绿路径可被门禁在同一行上同时断言（详档 §5.1 C1）。幂等。
-          LogCollector.markFirstHttp(activity)
-          // 0.13.8 #174：引擎就绪钩子——补投冷启动期间待发的来件通知（拷贝完成时
-          // 引擎尚未 listen 的竞态路径；fail-soft，失败留在待发清单等下一轮）。
-          try { FileIncoming.flushPending(activity) } catch (_: Throwable) {}
-          break
-        }
-        if (!activity.engineManager.engineProcessAlive()) {
-          // 引擎进程已死：宣判失败（自动回退路径），不再空等。
-          break
-        }
-        val clock = engineBootClock(pollBudgetMs - (budgetEnd - System.currentTimeMillis()))
+        return lastProbe.optBoolean("running", false)
+      }
+      while (SystemClock.elapsedRealtime() - pollStartedAt < pollBudgetMs) {
+        if (!currentAttempt()) return@Thread
+        booted = observeHttp()
+        if (!currentAttempt()) return@Thread
+        // booted means HTTP liveness, not completed browser authentication. The
+        // existing WebView auth recovery owns 401; 403 stays explicitly denied.
+        if (booted) break
+        if (!activity.engineManager.engineProcessAlive()) break
+        val clock = engineBootClock(SystemClock.elapsedRealtime() - pollStartedAt)
         if (engineBootShouldReport(clock.waitedSeconds)) {
           activity.runOnUiThread {
-            if (!isCurrentEngineFlow(generation)) return@runOnUiThread
+            if (!currentAttempt()) return@runOnUiThread
             activity.applyGuidePhase(GuidePhase.Starting, engineBootProgressText(clock))
           }
         }
         Thread.sleep(pollStepMs)
       }
-      if (!isCurrentEngineFlow(generation)) return@Thread
+      if (!currentAttempt()) return@Thread
+      if (!booted && activity.engineManager.engineProcessAlive()) {
+        LogCollector.writeBootDiag(activity, "boot-grace",
+          engineProbeDetail(lastProbe, engineGeneration) + " graceMs=$ENGINE_RECOVERY_GRACE_MS")
+        confirmEngineRecovery(
+          expectedGeneration = engineGeneration,
+          currentGeneration = { EngineManager.currentGeneration() },
+          cancelled = { !isCurrentEngineFlow(generation) || Thread.currentThread().isInterrupted },
+          stillUnhealthy = {
+            booted = observeHttp()
+            LogCollector.writeBootDiag(activity, "boot-recheck", engineProbeDetail(lastProbe, engineGeneration))
+            !booted
+          },
+        )
+      }
+      if (!currentAttempt()) return@Thread
       if (!booted && !activity.engineManager.engineProcessAlive()) {
         // 任务 19：失败终态落盘。这条路径是设备实测里最密集的失败形态（44 次 t_listen=-1 中
         // 多数是引擎进程死亡），必须留下「当时配置指纹 + 引擎日志状态 + 退出码」。
@@ -685,7 +730,7 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         //   故不在壳侧另取一份。）
         LogCollector.writeBootFail(
           activity, "process-died-during-boot",
-          "引擎进程在 " + ENGINE_BOOT_BUDGET_MS / 1000 + "s 预算内死亡且 Web 端口未就绪（t_listen=-1 形态）；" +
+          "引擎进程在启动观察期间死亡；" + engineProbeDetail(lastProbe, engineGeneration) + " " +
             LogCollector.describeEngineLogState(activity.filesDir),
         )
         // ── task-79（Bug A）：动态链接失败 ⇒ 判定运行时树损坏并触发一次重抽取 ──────────
@@ -705,12 +750,15 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           )
           activity.showGuide()
         }
-        onEngineStartTimeout(generation)
+        onEngineStartTimeout(generation, engineGeneration)
         // #118 建议7：进程死亡路径同样自动重试（可自愈的瞬时失败不必停在错误页）。
         scheduleEngineRetry(generation)
         return@Thread
       }
       if (booted) {
+        LogCollector.writeBootDiag(activity, "boot-http-ready", engineProbeDetail(lastProbe, engineGeneration) +
+          " auth=" + lastProbe.optString("auth", "unknown"))
+        try { FileIncoming.flushPending(activity) } catch (_: Throwable) {}
         // task-79：启动成功 ⇒ 清掉「运行时树损坏」标记（若不成功，标记留着供诊断与后续决策）。
         clearRuntimeTreeDamageMarker(activity)
         startEngineService()
@@ -725,17 +773,20 @@ internal class EngineStartFlow(private val activity: MainActivity) {
         // 它此前**只写一行 log 且不落盘**（log 只在调试采集器开启时才写），必须进失败终态。
         LogCollector.writeBootFail(
           activity, "boot-budget-exceeded",
-          "引擎进程存活但 " + ENGINE_BOOT_BUDGET_MS / 1000 + "s 预算内 Web 端口未就绪（t_listen=-1 形态）",
+          "引擎进程存活，启动预算与宽限复探后 HTTP 仍未就绪；" +
+            engineProbeDetail(lastProbe, engineGeneration) +
+            " elapsedMs=" + (SystemClock.elapsedRealtime() - pollStartedAt),
         )
-        LogCollector.log("dsh-shell", "engine boot window exceeded 90s; scheduling retry (half-dead ladder will take over if HTTP stays failing)")
+        LogCollector.log("dsh-shell", "engine boot budget and grace exhausted; scheduling non-destructive retry")
         scheduleEngineRetry(generation)
         activity.runOnUiThread {
           if (!isCurrentEngineFlow(generation)) return@runOnUiThread
-          activity.applyGuidePhase(GuidePhase.Starting, "引擎启动较慢（已超过 90s），已安排自动重试…")
+          activity.applyGuidePhase(GuidePhase.Starting, "引擎启动较慢，复查后仍未应答，已安排自动重试…")
         }
       }
       return@Thread
       } catch (t: Throwable) {
+        if (!isCurrentEngineFlow(generation)) return@Thread
         // **任务 19 的根因之一（关键）**：本 try **此前没有 catch**（只有 finally），于是启动线程里
         // 任何异常（NoSuchMethodError / OOM / 空指针等）都被抛到线程默认处理器——**壳侧零落盘**，
         // logcat 里也可能什么都没有。这正是用户反馈「启动失败时几乎不留任何诊断日志」的直接成因：
@@ -752,14 +803,14 @@ internal class EngineStartFlow(private val activity: MainActivity) {
           activity.showGuide()
         }
       } finally {
-        flowRunning.set(false)
+        flowRunning.release(flowOwner)
       }
     }.start()
   }
 
   /** True only for the active startup request and while the user has not closed it. */
   private fun isCurrentEngineFlow(generation: Long): Boolean =
-    !activity.userClosedEngine && flowGeneration.get() == generation
+    !activity.isDestroyed && !activity.userClosedEngine && flowGeneration.get() == generation
 
   /** Run the runtime snapshot update; status mirrored to a file for adb verification. */
   fun runUpdate() {
@@ -820,12 +871,12 @@ internal class EngineStartFlow(private val activity: MainActivity) {
     Thread {
       try {
         try {
-          Runtime.getRuntime().exec(arrayOf("/system/bin/pkill", "-f", "bin.js")).waitFor()
+          activity.engineManager.stopEngine(reason = "manual-restart", clearOrphans = true)
         } catch (_: Throwable) {
         }
-        EngineManager.lastStartAttemptAt = 0
-        flowRunning.set(false)
-        LogCollector.log("dsh-shell", "restart engine requested (pkill)")
+        activity.engineManager.resetCooldown()
+        flowRunning.invalidate()
+        LogCollector.log("dsh-shell", "restart engine requested source=manual")
         Thread.sleep(1000)
         activity.runOnUiThread {
           activity.showTestNotification("引擎重启中", "引擎进程已结束，正在重新启动…")

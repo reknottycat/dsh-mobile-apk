@@ -159,7 +159,7 @@ internal object FactoryProfilePatch {
     // ⓪ 归一旧「单点」写法（必须先于 reconcile/append：它是条目 id 层面的重构，
     //    后两步都建立在「条目集已正确」这一前提上）。
     val normalized = normalizeLegacyAgentDefaultModel(liveText)
-    val live = normalized.text
+    var live = normalized.text
     changes += normalized.changes
     // 归一的**结构化校验**（Lead 要求：放宽必须是有结构的收窄，不是削弱校验）。
     // 失败即抛：绝不把一个未校验的归一结果交给后续 reconcile/append，更不落盘。
@@ -170,6 +170,19 @@ internal object FactoryProfilePatch {
       }
     }
     val factoryBlocks = parseBlocks(factoryText)
+    // 0.2.x requires launch. Only migrate when this factory actually uses the new
+    // schema; preserving the user's executable is essential on upgraded devices.
+    val factoryUsesPtcLaunch = factoryBlocks.any { block ->
+      block.entries.any { entry ->
+        entry.id == "ptc-runtime" && lineRange(block.lines, entry.startLine, entry.endLine)
+          .lineSequence().any { it.trimStart().startsWith("launch:") }
+      }
+    }
+    if (factoryUsesPtcLaunch) {
+      val ptc = normalizeLegacyPtcLaunch(live)
+      live = ptc.text
+      changes += ptc.changes
+    }
     val factoryDisabled = LinkedHashMap<String, Boolean>()
     val factoryEntryIds = LinkedHashSet<String>()
     for (block in factoryBlocks) {
@@ -242,6 +255,86 @@ internal object FactoryProfilePatch {
       out += separator + tail
     }
     return Result(out, changes)
+  }
+
+  /** Migrates only ptc-runtime's direct config key, retaining scalar spelling and all other keys. */
+  internal fun normalizeLegacyPtcLaunch(text: String): Result {
+    val changes = ArrayList<String>()
+    val result = StringBuilder(text.length)
+    for (block in parseBlocks(text)) {
+      val replacements = HashMap<Int, String>()
+      for ((index, entry) in block.entries.withIndex()) {
+        if (entry.id != "ptc-runtime") continue
+        val fragment = lineRange(block.lines, entry.startLine, entry.endLine)
+        val migrated = migratePtcEntry(fragment, entry.indent.length + 2)
+        if (migrated != fragment) {
+          replacements[index] = migrated
+          changes += "ptc-runtime: nodeExecutable 迁移为 launch（保留用户路径）"
+        }
+      }
+      result.append(if (replacements.isEmpty()) block.text else rewriteBlock(block, replacements, emptySet()))
+    }
+    return Result(result.toString(), changes)
+  }
+
+  private fun migratePtcEntry(fragment: String, propertyIndent: Int): String {
+    val lines = splitLines(fragment)
+    fun body(index: Int) = lines[index].trimEnd('\r', '\n')
+    fun indent(line: String): Int {
+      var width = 0
+      while (width < line.length && line[width] == ' ') width++
+      return width
+    }
+    fun content(line: String) = line.isNotBlank() && !line.trimStart().startsWith("#")
+    val propertyPrefix = " ".repeat(propertyIndent)
+    // A user may reuse the id for a different plugin; that plugin's schema is not ours.
+    val names = lines.map { it.trimEnd('\r', '\n') }.filter { it.startsWith(propertyPrefix + "name:") }
+    if (names.any {
+        it.substringAfter("name:").substringBefore(" #").trim().trim('\'', '"') != "@deepseek-ai/dsh-ptc-runtime-node"
+      }) return fragment
+    val configIndices = lines.indices.filter {
+      val line = body(it)
+      indent(line) == propertyIndent && Regex("""config:\s*(#.*)?""").matches(line.trimStart())
+    }
+    if (configIndices.size != 1) return fragment
+    val start = configIndices.single() + 1
+    val end = (start until lines.size).firstOrNull {
+      val line = body(it)
+      content(line) && indent(line) <= propertyIndent
+    } ?: lines.size
+    val keyPattern = Regex("""^( +)([A-Za-z_][A-Za-z0-9_-]*):""")
+    val keys = (start until end).mapNotNull { index -> keyPattern.find(body(index))?.let { index to it } }
+    val configIndent = keys.minOfOrNull { it.second.groupValues[1].length } ?: return fragment
+    val direct = keys.filter { it.second.groupValues[1].length == configIndent }
+    // An explicit modern launch remains authoritative, including a user embedded runtime.
+    if (direct.any { it.second.groupValues[2] == "launch" }) return fragment
+    val legacy = direct.filter { it.second.groupValues[2] == "nodeExecutable" }
+    if (legacy.size != 1) return fragment
+    val nodeIndex = legacy.single().first
+    val original = lines[nodeIndex]
+    val scalar = original.substringAfter("nodeExecutable:")
+    if (scalar.trim().isEmpty() || scalar.trimStart().startsWith("#")) return fragment
+    val nodeEnd = (nodeIndex + 1 until end).firstOrNull {
+      val line = body(it)
+      content(line) && indent(line) <= configIndent
+    } ?: end
+    val eol = if (original.endsWith("\r\n") ||
+      (!original.endsWith("\n") && lines.any { it.endsWith("\r\n") })) "\r\n" else "\n"
+    val prefix = " ".repeat(configIndent)
+    return buildString(fragment.length + 48) {
+      append(lineRange(lines, 0, nodeIndex))
+      append(prefix).append("launch:").append(eol)
+      append(prefix).append("  kind: node-script").append(eol)
+      append(prefix).append("  executable:").append(scalar)
+      // Indent scalar continuation lines together so quoted/block scalar values retain
+      // their meaning. Leave unrelated same-level comments and whitespace untouched.
+      for (lineIndex in nodeIndex + 1 until nodeEnd) {
+        val line = lines[lineIndex]
+        if (line.isNotBlank() && indent(line) > configIndent) append("  ")
+        append(line)
+      }
+      append(lineRange(lines, nodeEnd, lines.size))
+    }
   }
 
   /**

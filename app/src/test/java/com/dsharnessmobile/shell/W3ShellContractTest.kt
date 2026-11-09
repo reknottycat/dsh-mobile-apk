@@ -252,8 +252,8 @@ class W3ShellContractTest {
     }
     val manager = codeOnly(source("EngineManager.kt"))
     assertTrue("引擎启动时刻必须由 spawn 点标记", manager.contains("LogCollector.markBootStart(context)"))
-    assertTrue("监听时刻必须由 spawn 起的观察线程标记", manager.contains("LogCollector.markListen(context)"))
-    assertTrue("启动主路径必须兜底补一次 listen 标记", codeOnly(source("EngineStartFlow.kt")).contains("LogCollector.markListen(activity)"))
+    assertTrue("监听时刻必须由 spawn 起的观察线程标记", manager.contains("LogCollector.markListen(context, generation)"))
+    assertTrue("启动主路径必须兜底补一次 listen 标记", codeOnly(source("EngineStartFlow.kt")).contains("LogCollector.markListen(activity, engineGeneration)"))
     assertTrue(
       "三字段行必须落壳侧自有判据文件（r10 设备实测：写 engine.log 会被引擎从自己的偏移覆盖）",
       collector.contains("SEGMENTS_FILE = \"boot-segments.log\"") &&

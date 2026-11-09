@@ -50,6 +50,12 @@
     - id: dshmarketplace
       name: dshmarketplace-plugin
 
+# Subscription accounts and the custom-service form share Settings → Subscriptions.
+# No factory provider configuration: existing user accounts/settings remain authoritative.
+- insert:
+    - id: llm-subscriptions
+      name: dsh-plugin-subscriptions
+
 # 在外部应用打开（0.1.5 新增，桌面编排）：上游 host/client 探查 Finder/Terminal/编辑器目录，
 # Android 上没有等价候选。两条 row 关闭，改由注入层的会话头部入口 + 壳侧系统选择器（PathOpen）承担。
 - id: open-in-app
@@ -207,7 +213,10 @@
 # 逆转条件：上游 NodePtcRuntime 自己解析执行世界里的 node（不再缺省取 process.execPath）后，本行可撤。
 - id: ptc-runtime
   config:
-    nodeExecutable: /data/data/com.dsharnessmobile.shell/files/usr/libexec/dsh-node
+    # Harness 0.2.1+ uses an explicit launch union; the Android linker wrapper remains required.
+    launch:
+      kind: node-script
+      executable: /data/data/com.dsharnessmobile.shell/files/usr/libexec/dsh-node
 
 # Office→PDF（0.14.2 追版决策，2026-09-25 实测）——**显式禁用上游 web-app bundle 的 office-to-pdf 行**。
 # rc.1 新增该行（0.1.5 的 web-app bundle 里 office 零命中），它运行时依赖
@@ -224,4 +233,14 @@
 # 凭据：check-engine-overlay 正向闭包的 RUNTIME_MISSING_OK 登记了同一条（两处必须同进同出）。
 # 逆转条件：出现 Android 上真能跑的引擎实现 ⇒ 同时删掉本行与那条豁免。
 - id: office-to-pdf
+  disabled: true
+
+# Harness 0.2.2 desktop telemetry rows are not Android services; shared otel remains mounted.
+- id: desktop-product-telemetry
+  disabled: true
+- id: product-analytics
+  disabled: true
+
+# Android ships bash, not PowerShell. Its optional row otherwise competes for the same PTY backend.
+- id: optional-terminal-pwsh
   disabled: true
